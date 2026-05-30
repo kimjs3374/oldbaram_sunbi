@@ -1,0 +1,91 @@
+capture:
+  monitor_index: 1
+  fps_target: 60
+vision:
+  imgsz: 640
+  conf: 0.25
+  half: true
+  device: 0
+ocr:
+  coord_w: 160
+  coord_h: 28
+  coord_right_pad: 115
+  coord_bottom_pad: 4
+  coord_upscale: 4
+  map_w: 220
+  map_h: 28
+  map_top_pad: 8
+  map_left_pad: 420
+  map_upscale: 3
+  ocr_every_n_frames: 10
+net:
+  port: 54545
+  send_rate_hz: 30
+  peers:
+  - 100.75.199.37
+  - 100.117.1.46
+  bind_host: 0.0.0.0
+input:
+  target_window: msw.exe
+  keydown_ms_min: 30
+  keydown_ms_max: 70
+  jitter_ms: 50
+  method: sendinput
+fsm:
+  red_lost_sec: 1.0
+  stuck_sec: 3.0
+  dead_reckon_sec: 2.0
+v2_regions:
+  game:
+    x: 150
+    y: 122
+    w: 776
+    h: 535
+  coord:
+    x: 1073
+    y: 778
+    w: 115
+    h: 21
+  map:
+    x: 443
+    y: 105
+    w: 193
+    h: 26
+  cooldown:
+    x: 946
+    y: 484
+    w: 247
+    h: 88
+  buff:
+    x: 966
+    y: 366
+    w: 211
+    h: 95
+  chat:
+    x: 144
+    y: 775
+    w: 580
+    h: 30
+  hp:
+    x: 1117
+    y: 711
+    w: 84
+    h: 18
+  mp:
+    x: 1109
+    y: 729
+    w: 90
+    h: 16
+  nick:
+    x: 1018
+    y: 668
+    w: 65
+    h: 30
+  xp:
+    x: 1062
+    y: 743
+    w: 136
+    h: 20
+v2_msw_origin:
+  x: 18
+  y: 109

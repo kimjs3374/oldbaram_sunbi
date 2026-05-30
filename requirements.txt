@@ -1,0 +1,39 @@
+# oldbaram 실행 환경 고정 (freeze.txt 기준, src/ import 추림)
+# Python 3.11 / 3.12 (64bit), Windows 11, CUDA 12.4 (RTX 4060 Ti 등)
+#
+# torch/torchvision은 PyPI 기본 인덱스에 +cu124 휠이 없으므로 아래 인덱스 병행:
+#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124
+#
+# 설치 순서 권장:
+#   1) pip install --upgrade pip
+#   2) pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124
+
+# --- GPU 런타임 ---
+torch==2.5.1+cu124
+torchvision==0.20.1+cu124
+
+# --- YOLO ---
+ultralytics==8.4.37
+ultralytics-thop==2.0.18
+
+# --- OCR ---
+# PaddleOCR: 맵이름 한국어 (models/korean_PP-OCRv5_mobile_rec 로컬 모델)
+# EasyOCR: 좌표 숫자 (GPU 10~20ms, 최초 실행 시 모델 자동 다운로드)
+paddleocr==3.4.0
+paddlepaddle==3.3.1
+easyocr==1.7.2
+
+# --- 비전/캡처 ---
+opencv-python==4.13.0.92
+mss==10.1.0
+numpy==2.4.3
+pillow==12.1.1
+
+# --- GUI / Win32 입력 ---
+PyQt5==5.15.11
+PyQt5-Qt5==5.15.2
+PyQt5_sip==12.18.0
+pywin32==311
+
+# --- 설정 파일 ---
+PyYAML==6.0.2
