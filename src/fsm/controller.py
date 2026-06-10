@@ -130,6 +130,15 @@ class Follower:
         # 주기로 점프). 3으로 막으니 TRAIL-REJECT 1947회(push 245)로 trail 텅 빔
         # → 추종 전멸. 8 복원. (19,4) 노이즈 문제는 jump_reject로 못 잡음 — 별도.
         self._jump_reject_threshold: int = 8
+        # 2026-06-11 맵 끝자리 OCR 오독 게이트: 맵바 폰트≠좌표 폰트라 digit_cnn
+        # 재사용 불가 → 폰트 무관 방식. 옛바 1칸이동이라 같은맵 격수좌표는
+        # d≤4(v30 jump_max). 격수 좌표가 연속인데 맵명만 변하면 끝자리 OCR
+        # 오독(실증 02:55: 격수 (22,6)→(26,6) R연속인데 맵 z2↔z3 진동).
+        # min_jump=5(>jump_max 4)면 거부, N프레임 연속초과만 진짜 전환 수용.
+        self._atk_prev_coord = None
+        self._map_change_min_jump: int = 5
+        self._map_ocr_reject: int = 0
+        self._map_ocr_reject_max: int = 3
         self._fresh_reject_threshold: int = 3
         # 맵별 "방금 리셋된 상태" 플래그 — 첫 push에 이전 맵 exit_coord 체크용.
         self._fresh_map_guard: dict = {}  # map_name → (exit_coord, expires_ts)
@@ -400,6 +409,38 @@ class Follower:
         self._last_healer_mapchg_ts = now
         self._healer_map = map_name
 
+    def _map_ocr_gate(self, s) -> None:
+        """맵 끝자리 OCR 오독 거부 — 격수 좌표 연속이면 맵전환 아님.
+
+        부수효과: 오독 판정 시 s.map_name 을 직전 맵으로 되돌림(거부).
+        맵바 폰트≠좌표 폰트로 digit_cnn 재사용 불가 → 폰트 무관 좌표 게이트.
+        옛바 1칸이동: 같은맵 격수좌표 d≤4(v30 jump_max). 맵명만 변하고 좌표
+        연속(<min_jump)이면 끝자리 오독. N프레임 연속초과면 진짜 전환 수용.
+        """
+        if not (s.map_name and self._last_map
+                and s.map_name != self._last_map
+                and getattr(s, "coord_valid", False)
+                and self._atk_prev_coord is not None):
+            self._map_ocr_reject = 0
+            return
+        pcx, pcy = self._atk_prev_coord
+        d_atk = abs(s.x - pcx) + abs(s.y - pcy)
+        if d_atk >= self._map_change_min_jump:
+            self._map_ocr_reject = 0  # 좌표 급변 동반 = 진짜 맵전환.
+            return
+        self._map_ocr_reject += 1
+        if self._map_ocr_reject <= self._map_ocr_reject_max:
+            if self.log is not None:
+                self.log.debug(
+                    f"[MAP-OCR-HOLD] {self._last_map!r}→{s.map_name!r} "
+                    f"격수좌표연속 d={d_atk}(<{self._map_change_min_jump}) "
+                    f"끝자리 오독 거부 "
+                    f"{self._map_ocr_reject}/{self._map_ocr_reject_max}"
+                )
+            s.map_name = self._last_map  # 오독 거부 → 직전 맵 유지.
+        else:
+            self._map_ocr_reject = 0  # 연속 초과 = 실제 전환 → 통과.
+
     def update(self, s: Optional[State]) -> FsmState:
         now = time.time()
         if s is None:
@@ -407,6 +448,12 @@ class Follower:
 
         if getattr(s, "seq", 0) > 0 or getattr(s, "coord_valid", False):
             self._last_udp_time = now
+
+        # 맵 끝자리 OCR 오독 게이트 (pre-pipeline) — 격수 좌표 연속이면 맵명
+        # 변화를 오독으로 거부. 직후 _atk_prev_coord 갱신(다음 프레임 기준).
+        self._map_ocr_gate(s)
+        if getattr(s, "coord_valid", False):
+            self._atk_prev_coord = (s.x, s.y)
 
         # C안: 역방향 맵 복귀 디바운스 — **pre-pipeline 위치**.
         # 2026-04-15 수정: 과거엔 MAP-SEQ-EDGE/MAP-SYNC 설정 **뒤**에 있어
