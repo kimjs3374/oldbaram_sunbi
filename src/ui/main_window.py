@@ -3795,6 +3795,13 @@ class MainWindow(QtWidgets.QMainWindow):
             cloud_panel.auto_upload_log(self)
         except Exception:
             pass
+        # 종료 시 맵바 crop 학습데이터 자동 업로드 (맵 OCR 재설계용).
+        # _crop_map 이 logs/map_crops/ 에 모은 crop 을 클라우드로. 없으면 조용히.
+        try:
+            from ..tools import cloud_map_upload
+            cloud_map_upload.main()
+        except Exception:
+            pass
         # 설정 자동 저장.
         try:
             self._save_settings()
