@@ -100,39 +100,15 @@ class Attacker:
         # 힐러는 이 플래그 활성화 구간 동안 B3 coord-follow를 차단 (스테일 좌표 오발사 방지).
         self._f1_window_sec = 5.0
         self._f1_pending_until = 0.0
+        # 좌표급변(=맵전환, 워프 거의 없음) 감지 시 맵이름 OCR 갱신까지
+        # map_change_pending 강제 ON → 격수 맵OCR(PaddleOCR) 지연을 좌표(0.01초)로 흡수.
+        self._map_chg_until = 0.0
         self._f1_prev_down = False
         # 격수 본인 쿨 OCR — 설정 탭에서 영역/스킬 주입 전까진 inactive.
         self.cd_ocr = CooldownOcr(poll_sec=1.0, name="atk_cd")
         self.cd_ocr.start()
         self._last_own_cd_emit = 0.0
         self._own_cd_emit_period = 1.0  # 초.
-        # 격수 버프 영역 OCR — 혼마술 디버프 감시 (감지=격수, 시전=힐러).
-        # 영역이 cfg 나 GUI 드래그로 지정될 때까진 inactive.
-        # own_rec=True: 전용 TextRecognition. shared rec 동시 predict 경합으로
-        # raw_text='' 관측되어 혼마술 edge 미발화 → 파혼술 안 쓰이던 증상 대응.
-        self.buff_ocr = CooldownOcr(poll_sec=1.0, own_rec=True, name="atk_buff")
-        try:
-            # 혼마술(디버프) + 무장/보호(버프, 부재 감지). 버프 영역 공용.
-            self.buff_ocr.set_target_skills(["혼마술", "무장", "보호"])
-        except Exception:
-            pass
-        self.buff_ocr.start()
-        # cfg 에 저장된 버프 영역이 있으면 즉시 주입 (힐러/격수 공용 buff_region_*).
-        # 버프영역=혼마술영역 (사용자 2026-04-20). 격수 PC 에서는 이 영역이
-        # 혼마술 디버프 표시 위치로 사용됨.
-        try:
-            cd = getattr(cfg, "cooldown", None)
-            bx = int(getattr(cd, "buff_region_x", -1))
-            bw = int(getattr(cd, "buff_region_w", 0))
-            if bx >= 0 and bw > 0:
-                self.buff_ocr.set_region(
-                    bx,
-                    int(getattr(cd, "buff_region_y", 0)),
-                    bw,
-                    int(getattr(cd, "buff_region_h", 0)),
-                )
-        except Exception as _e:
-            self.log(f"[attacker][buff] cfg region 주입 실패: {_e}")
         # HP/MP OCR 리더 — 영역 지정 시 OCR 결과(cur/max → pct) 를 State 로 송신.
         from ..vision.hpmp import HpMpReader
         self.hpmp = HpMpReader(log_cb=self.log)
@@ -183,10 +159,6 @@ class Attacker:
             pass
         try:
             self.cd_ocr.stop()
-        except Exception:
-            pass
-        try:
-            self.buff_ocr.stop()
         except Exception:
             pass
         # 2026-04-22: Async 3종(grabber/yolo/ocr) 백그라운드 스레드 정리.
@@ -282,70 +254,6 @@ class Attacker:
             return dict(getattr(r, "skills", {}) or {})
         except Exception:
             return {}
-
-    # ---- 격수 버프 영역 API (혼마술 감시) ----
-    def set_buff_region(self, x: int, y: int, w: int, h: int) -> None:
-        try:
-            self.buff_ocr.set_region(int(x), int(y), int(w), int(h))
-            self.log(
-                f"[attacker][buff] region 설정 x={x} y={y} w={w} h={h}"
-            )
-        except Exception as e:
-            self.log(f"[attacker][buff] set_region 실패: {e}")
-
-    def clear_buff_region(self) -> None:
-        try:
-            self.buff_ocr.clear_region()
-            self.log("[attacker][buff] region 해제")
-        except Exception:
-            pass
-
-    def _buff_presence(self, keyword: str) -> int:
-        """격수 버프 관측 상태. 가능하면 실제 남은 초를, 숫자 파싱 실패 시
-        최소한 존재 여부만 반환.
-
-        반환:
-          >=1 = 버프 존재. 숫자 파싱 성공 시 남은 초. 실패 시 1.
-          0   = OCR 돌았지만 keyword 전혀 없음 → 버프 없음 (시전 필요).
-          -1  = OCR 미수행 (ts=0) → 모름 (판단 보류).
-
-        2026-04-21: skills dict 의 숫자값이 양수면 그대로 반환 → 로그/UI
-        에 실제 초단위 표시. 숫자 파싱 실패한 경우에만 raw_text 관대 매칭
-        으로 1 반환. 힐러 predicate `>0` 는 두 경우 모두 True.
-        """
-        try:
-            r = self.buff_ocr.latest()
-            if float(getattr(r, "ts", 0) or 0) <= 0:
-                return -1
-            # 1순위: skills dict 의 정상 파싱 결과.
-            try:
-                skills = dict(getattr(r, "skills", {}) or {})
-                v = int(skills.get(keyword, -1))
-                if v > 0:
-                    return v  # 실제 남은 초 (예: 28).
-            except Exception:
-                pass
-            # 2순위: raw_text 관대 매칭 (숫자 파싱 실패 시).
-            raw = str(getattr(r, "raw_text", "") or "")
-            if keyword in raw:
-                return 1
-            if len(keyword) >= 2 and keyword[0] in raw:
-                return 1
-            return 0
-        except Exception:
-            return -1
-
-    def latest_debuff_honmasul_sec(self) -> int:
-        """혼마술 감지. 1=걸림(파혼술 시전), 0=없음, -1=모름."""
-        return self._buff_presence("혼마술")
-
-    def latest_buff_mujang_sec(self) -> int:
-        """무장 감지. 1=걸림(시전 안 함), 0=없음(시전), -1=모름."""
-        return self._buff_presence("무장")
-
-    def latest_buff_boho_sec(self) -> int:
-        """보호 감지. 1=걸림, 0=없음(시전), -1=모름."""
-        return self._buff_presence("보호")
 
     # ---- HP/MP 영역 API (격수 본인 HP/MP → UDP State 로 송신) ----
     def set_hp_region(self, x: int, y: int, w: int, h: int) -> None:
@@ -484,12 +392,6 @@ class Attacker:
                     self.cd_ocr.submit_frame(frame, origin)
             except Exception:
                 pass
-            # 격수 버프(혼마술/무장/보호) OCR — 포커스 있고 영역 지정됐을 때만.
-            try:
-                if fg_ok and self.buff_ocr.ready():
-                    self.buff_ocr.submit_frame(frame, origin)
-            except Exception:
-                pass
             # 본인 쿨 결과 주기 emit — 초당 1회.
             try:
                 now_emit = time.time()
@@ -566,38 +468,10 @@ class Attacker:
                         f"{self._f1_window_sec:.1f}s"
                     )
                 self._f1_prev_down = f1_down
-            pending_now = time.time() < self._f1_pending_until
+            _t_now = time.time()
+            pending_now = ((_t_now < self._f1_pending_until)
+                           or (_t_now < self._map_chg_until))
 
-            # 혼마술 감시 결과 — 감지 시 힐러가 파혼술 시전.
-            try:
-                _debuff_sec = int(self.latest_debuff_honmasul_sec())
-            except Exception:
-                _debuff_sec = -1
-            # 무장/보호 버프 관측 — 없으면 힐러가 시전.
-            try:
-                _mujang_sec = int(self.latest_buff_mujang_sec())
-            except Exception:
-                _mujang_sec = -1
-            try:
-                _boho_sec = int(self.latest_buff_boho_sec())
-            except Exception:
-                _boho_sec = -1
-            # 2026-04-22 진단 로그: raw_text 변경시만 출력. 혼마술 OCR 미발화 원인
-            # 확정용 (region/band/predict 중 어디서 막히는지 1줄로 판별).
-            try:
-                _bf_r = self.buff_ocr.latest()
-                _raw_txt = str(getattr(_bf_r, "raw_text", "") or "")
-                _diag = str(getattr(self.buff_ocr, "_last_diag", "") or "")
-                _prev = getattr(self, "_last_buff_dbg_key", None)
-                _key = (_raw_txt, _debuff_sec, _mujang_sec, _boho_sec)
-                if _key != _prev:
-                    self._last_buff_dbg_key = _key
-                    self.log(
-                        f"[ATK-BUFF-DBG] raw={_raw_txt!r} diag='{_diag}' "
-                        f"h={_debuff_sec} m={_mujang_sec} b={_boho_sec}"
-                    )
-            except Exception:
-                pass
             # HP/MP 즉시 읽기 (픽셀 비율, 가벼움). 포커스 없을 땐 skip.
             _hp_pct = -1
             _mp_pct = -1
@@ -622,11 +496,8 @@ class Attacker:
                 last_dir=self._last.last_dir,
                 map_seq=self._map_seq,
                 map_change_pending=pending_now,
-                debuff_honmasul_sec=_debuff_sec,
                 hp_pct=_hp_pct,
                 mp_pct=_mp_pct,
-                buff_mujang_sec=_mujang_sec,
-                buff_boho_sec=_boho_sec,
             )
 
             if frame_i % every == 0 and fg_ok:
@@ -685,6 +556,9 @@ class Attacker:
                             f"thr={self._warp_threshold} "
                             f"→ map_seq={self._map_seq}"
                         )
+                        # 좌표급변=맵전환 시작 (워프 거의 없음). 맵이름 OCR
+                        # 갱신(ATK-MAP-EDGE)까지 map_change_pending 강제 ON.
+                        self._map_chg_until = time.time() + 4.0
                 # 2026-04-22 B안: 맵 이름 변경 감지 — map_seq++ + burst 만 수행.
                 # 이전 coord suppress(hold) 로직은 제거. 맵 전환 순간 OCR "새맵+
                 # 옛좌표" 오염 방지는 힐러측 _fresh_map_guard(exit_coord 근접 거부)
@@ -700,6 +574,7 @@ class Attacker:
                             f"burst={self._map_burst_n}"
                         )
                     self._prev_sent_map = r.map_name
+                    self._map_chg_until = 0.0  # 맵이름 갱신 = 맵전환 완료
                     # 사냥 분석 — 바퀴 이벤트.
                     try:
                         lap = self.analytics.on_map(r.map_name)
@@ -731,6 +606,9 @@ class Attacker:
 
             # OCR 블록에서 map_seq가 증가했을 수 있으므로 송신 직전 재스탬프.
             st.map_seq = self._map_seq
+            # 좌표급변(OCR블록에서 _map_chg_until 갱신됨) 반영 — OCR 후 재스탬프.
+            st.map_change_pending = ((time.time() < self._f1_pending_until)
+                                     or (time.time() < self._map_chg_until))
             # 2026-04-22: 격수 YOLO 빨탭 인식 (이전엔 "빨탭 없음 → YOLO 불필요"
             # 로 스킵했으나 스킬범위 오버레이가 자기 빨탭 좌표를 요구 → 활성화).
             # 힐러와 동일 학습 가중치(cfg.vision.weights) 공유.

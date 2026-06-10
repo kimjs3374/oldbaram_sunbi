@@ -1,4 +1,6 @@
 """힐러 PC 메인 컨트롤러. UDP 수신 state → 현재 FSM 상태 평가 → 입력 송신."""
+import json
+import pathlib
 import time
 from collections import deque
 from typing import Optional
@@ -65,6 +67,9 @@ class Follower:
         # 태그 전이 감지 시 N초 동안 exit_dir 강제 홀드 (다른 이동 결정 무시).
         # 격수가 맵 넘긴 순간 힐러에게 "무조건 exit_dir로 이동" 지시.
         self._force_exit_until: float = 0.0
+        # 2026-06-11 수정A: 본인 빨탭 후 맵전환(전이시도) 직후 흰탭 재arm 억제 창.
+        self._post_tab_grace_until: float = 0.0
+        self._post_tab_grace_sec: float = 1.5
         self._force_exit_sec: float = 2.5
         # 2026-04-22: 격수가 포탈 살짝 담그고 돌아오는(A→B→A 왕복) 경우 힐러가
         # 무조건 따라 들어가는 문제 방지. CTRL-MAPCHG 감지 후 pend_delay 지연 뒤
@@ -134,6 +139,23 @@ class Follower:
         self._map_sync_duration: float = 0.3
         self._healer_last_coord_by_map: dict = {}  # map_name → (x,y)
         self._healer_coord_jump_threshold: int = 60
+        # 포탈 DB (2026-06-10 사용자 제안): (from_map→to_map) 포탈 좌표 영구 누적.
+        # 격수 맵전환 확정 시 경계 정제된 exit_coord 기록 → 다음부턴 중앙값으로
+        # 포탈 위치/방향 직행 (OCR 노이즈·UDP 누락 무관). 파일=실행루트.
+        # 2026-06-11: portals_v2 로 파일명 변경 → v24 EXIT-BOUNDARY 코너보완
+        # 이전에 쌓인 잘못된 학습(예 2-3(1)→(2) (19,5)U)을 자동 폐기하고
+        # v24 로직으로 새로 학습. 구 portals.json 은 무시(사용자 수동삭제 불필요).
+        self._portal_db_path = (pathlib.Path(__file__).resolve().parents[2]
+                                / "portals_v2.json")
+        self._portal_db: dict = {}  # "from|to" → {coords:[[x,y]..], dir, n}
+        self._load_portal_db()
+        # EXIT-FALLBACK (2026-06-10): exit_dir 오판/출구좌표 UDP누락 안전망.
+        # map_neq 지속 + 힐러 좌표 8초 정체(정상 전환 실측 최대 5.3s + 여유)
+        # → exit_dir 교체 (반대→직교 순환). healer-120 (7) 14초 정체 사고 대응.
+        self._exit_fallback_sec: float = 8.0
+        self._exit_fallback_n: int = 0
+        self._healer_coord_progress_ts: float = time.time()
+        self._healer_coord_progress_base: Optional[tuple] = None
         # TAB-CONFIRM: 흰탭 감지 → Home→Tab → red&!white 확정. 상세는 tab_confirm.py.
         # Follower 는 _tab 인스턴스에 위임. 하위 호환용 property 로 외부 노출.
         self._tab = TabConfirm(
@@ -145,6 +167,120 @@ class Follower:
             post_confirm_duration=0.0,
             retry_max=2,
         )
+
+    # ---- 경계 기반 출구점 (2026-06-10) ----
+    @staticmethod
+    def _boundary_exit(pts) -> tuple:
+        """trail 점열에서 '관측 bbox 경계에 닿은 마지막 점'을 출구로 선택.
+
+        포탈은 맵 가장자리(상하좌우 어느 쪽이든, 맵마다 다름)에 있고 절대
+        경계값은 하드코딩 불가 → 그 맵에서 관측된 min/max 상대 판정.
+        마지막 1점 OCR 노이즈가 경계에 안 닿으면 자동 배제됨
+        (healer-120 (7) 사고: tail (6,1)→(4,7) 노이즈가 exit_dir 'D' 오판).
+        반환 (coord, dir, idx) — 못 찾으면 (None, None, None).
+        idx는 경계점의 trail 내 위치 — 그 뒤 점들은 오염(맵명 OCR 지연 창에
+        들어온 새 맵 좌표) 절단용 (healer-37 (7) 사고 2026-06-10).
+        """
+        pl = list(pts) if pts else []
+        if len(pl) < 2:
+            return None, None, None
+        xs = [p[0] for p in pl]
+        ys = [p[1] for p in pl]
+        xmin, xmax = min(xs), max(xs)
+        ymin, ymax = min(ys), max(ys)
+        # 폭이 너무 좁은 축은 판정 제외 (복도형 맵 — 전부 경계가 돼버림).
+        use_x = (xmax - xmin) >= 3
+        use_y = (ymax - ymin) >= 3
+
+        def _bcands(px, py):
+            c = []
+            if use_x and px <= xmin + 1:
+                c.append("L")
+            if use_x and px >= xmax - 1:
+                c.append("R")
+            if use_y and py <= ymin + 1:
+                c.append("U")
+            if use_y and py >= ymax - 1:
+                c.append("D")
+            return c
+
+        # 뒤에서부터 최대 10점. 경계 닿은 점 + 진행방향 일치 채택.
+        # OCR 노이즈 점프는 bbox 극값을 만들어도 진행 방향과 어긋나 기각됨
+        # (healer-120 (7) 사고: 오염 다점 (6,1)→(3,6)→(4,6) 진행불일치 기각,
+        #  (7,1) U 채택). 이 부분은 그대로 — 다점 오염에 강건.
+        # 2026-06-11 보완: 마지막 점이 코너(2축 경계)이고 직전 점이 이미 한
+        # 경계축에 도달했으면 그 축 우선 (포탈 앞 미세조정 강건).
+        #  healer-37 2-3(1)→(2): 격수 (18,9)→(19,9) R로 xmax 도달 후 (19,4)
+        #  로 y만 변동 → 코너 (19,4) 의 진행 U 대신, 직전 (19,9) 가 공유하는
+        #  R 경계 채택. 기존엔 진행 U 일치로 (19,5)U 오학습했음.
+        lo = max(0, len(pl) - 10)
+        for i in range(len(pl) - 1, lo - 1, -1):
+            px, py = pl[i]
+            cands = _bcands(px, py)
+            if not cands:
+                continue
+            if i >= 1:
+                qx, qy = pl[i - 1]
+                # 코너 보완: 직전 점과 공유하는 경계축이 정확히 1개면 그 축.
+                if len(cands) >= 2:
+                    shared = [c for c in cands if c in _bcands(qx, qy)]
+                    if len(shared) == 1:
+                        return (px, py), shared[0], i
+                dx, dy = px - qx, py - qy
+                if dx or dy:
+                    pref = (("R" if dx > 0 else "L")
+                            if abs(dx) >= abs(dy)
+                            else ("D" if dy > 0 else "U"))
+                    if pref in cands:
+                        return (px, py), pref, i
+                    continue  # 진행-경계 불일치 = 노이즈 의심 → 더 과거로.
+                continue  # 제자리 dedup 직후 — 판정 불가, 더 과거로.
+            return (px, py), cands[0], i
+        return None, None, None
+        return None, None, None
+
+    # ---- 포탈 DB (2026-06-10) ----
+    def _load_portal_db(self) -> None:
+        try:
+            if self._portal_db_path.exists():
+                self._portal_db = json.loads(
+                    self._portal_db_path.read_text(encoding="utf-8"))
+        except Exception:
+            self._portal_db = {}
+
+    def _save_portal_db(self) -> None:
+        try:
+            self._portal_db_path.write_text(
+                json.dumps(self._portal_db, ensure_ascii=False, indent=1),
+                encoding="utf-8")
+        except Exception:
+            pass
+
+    def _portal_record(self, from_map: str, to_map: str,
+                       coord, direction: str) -> None:
+        """이번 전환에서 관측한 출구좌표/방향 누적 (최근 9회 유지)."""
+        if not from_map or not to_map or coord is None:
+            return
+        key = f"{from_map}|{to_map}"
+        e = self._portal_db.setdefault(
+            key, {"coords": [], "dir": "-", "n": 0})
+        e["coords"].append([int(coord[0]), int(coord[1])])
+        e["coords"] = e["coords"][-9:]
+        e["n"] = int(e.get("n", 0)) + 1
+        if direction in ("L", "R", "U", "D"):
+            e["dir"] = direction
+        self._save_portal_db()
+
+    def portal_lookup(self, from_map: str, to_map: str) -> tuple:
+        """과거 관측 포탈 (coord, dir). 좌표는 축별 중앙값(노이즈 흡수)."""
+        e = self._portal_db.get(f"{from_map}|{to_map}")
+        if not e or not e.get("coords"):
+            return None, "-"
+        xs = sorted(c[0] for c in e["coords"])
+        ys = sorted(c[1] for c in e["coords"])
+        mid_x = xs[len(xs) // 2]
+        mid_y = ys[len(ys) // 2]
+        return (mid_x, mid_y), str(e.get("dir", "-"))
 
     def note_healer_map(self, map_name: str, healer_coord: Optional[tuple] = None):
         """힐러 자신의 맵 이름 주입 (OCR 결과). 맵 전환 3단계 판정용.
@@ -161,6 +297,13 @@ class Follower:
         # 맵 OCR이 아직 못 따라잡은 상태라 정책: h_map==a_map 될 때까지 이동 보류.
         # 맵이 이미 바뀐 프레임에서도 이전 맵 기준 좌표가 기록돼 있으면 트리거 가능.
         if healer_coord is not None and map_name:
+            # EXIT-FALLBACK 진행 추적: 힐러 좌표가 base 대비 맨해튼 2 이상
+            # 움직이면 진행으로 간주 (1칸 제자리 진동은 무시) → 타이머 리셋.
+            base = self._healer_coord_progress_base
+            if base is None or (abs(healer_coord[0] - base[0])
+                                + abs(healer_coord[1] - base[1])) >= 2:
+                self._healer_coord_progress_base = healer_coord
+                self._healer_coord_progress_ts = now
             prev_hc = self._healer_last_coord_by_map.get(map_name)
             if prev_hc is not None:
                 dj = (abs(healer_coord[0] - prev_hc[0])
@@ -330,12 +473,24 @@ class Follower:
             # + 새 맵 안정 후 새로운 arm 조건(FOLLOW & map_eq & 흰탭 3프레임)이
             # 다시 평가됨. Tab/ESC 재송신 방지.
             if self._tab.active:
+                _was_tab_sent = self._tab.tab_sent
                 old_sub = self._tab.reset()
                 if self.log is not None:
                     self.log.debug(
                         f"[TAB-CONFIRM-CANCEL] MAP-SEQ-EDGE → "
-                        f"route sub={old_sub!r} 폐기"
+                        f"route sub={old_sub!r} 폐기 tab_sent={_was_tab_sent}"
                     )
+                # 2026-06-11 수정A: 이미 본인 빨탭(Tab) 송신 후 맵 전환됨
+                # = G1 전이 시도 완료. 새 맵에서 즉시 재arm 하면 또 본인 빨탭
+                # → 본인 힐 루프(사용자 #5-1). grace 동안 흰탭 arm 억제 →
+                # 전이됐으면 빨탭 정상, 진짜 흰탭이면 grace 후 재시도.
+                if _was_tab_sent:
+                    self._post_tab_grace_until = now + self._post_tab_grace_sec
+                    if self.log is not None:
+                        self.log.info(
+                            f"[POST-TAB-GRACE] 본인빨탭 후 맵전환=전이시도 → "
+                            f"{self._post_tab_grace_sec:.1f}s arm 억제"
+                        )
 
         # MAP-SYNC 해제 조건: h_map == a_map 확정되면 즉시 sync 해제.
         # (맵 OCR 따라잡음 — 좌표-맵 일관성 회복).
@@ -349,6 +504,34 @@ class Follower:
                 )
             self._map_sync_until = 0.0
 
+        # EXIT-FALLBACK (2026-06-10): exit_dir 오판/출구좌표 UDP누락 안전망.
+        # 조건: 맵 불일치(전환 못 끝냄) + 힐러 좌표 8초 정체(맨해튼<2,
+        #       정상 전환 실측 최대 5.3s + 여유) → exit_dir 교체.
+        # 순서: 반대방향 먼저 (오판이면 반대가 정답일 확률 — (7) 사고 D→U),
+        #       그다음 직교 2방향 순환. 좌표 진행/맵 일치 시 자동 리셋.
+        _mapneq_now = bool(self._healer_map and self._last_map
+                           and self._healer_map != self._last_map)
+        if not _mapneq_now:
+            self._exit_fallback_n = 0
+        elif (self._exit_dir in ("L", "R", "U", "D")
+              and now - self._healer_coord_progress_ts
+              >= self._exit_fallback_sec):
+            _rev = {"L": "R", "R": "L", "U": "D", "D": "U"}
+            _ortho = {"L": ["U", "D"], "R": ["U", "D"],
+                      "U": ["L", "R"], "D": ["L", "R"]}
+            cands = [_rev[self._exit_dir]] + _ortho[self._exit_dir]
+            new_dir = cands[self._exit_fallback_n % len(cands)]
+            self._exit_fallback_n += 1
+            self._healer_coord_progress_ts = now  # 다음 8초 재카운트
+            if self.log is not None:
+                self.log.info(
+                    f"[EXIT-FALLBACK] {self._exit_fallback_sec:.0f}s 정체 → "
+                    f"exit_dir {self._exit_dir!r}→{new_dir!r} "
+                    f"(try#{self._exit_fallback_n} "
+                    f"h_map={self._healer_map!r} a_map={self._last_map!r})"
+                )
+            self._exit_dir = new_dir
+
         # 좌표/맵별 last_seen 기록을 **transition 체크보다 먼저** 수행 (피드백 1:
         # "맵 변경 감지 순간이 아니라 계속 격수이동경로는 기록해야됨").
         # 그렇지 않으면 transition_phase 동안 early return으로 기록 누락.
@@ -358,7 +541,10 @@ class Follower:
             last_valid = self._atk_last_valid_coord_by_map.get(s.map_name)
             if last_valid is not None:
                 dj = (abs(s.x - last_valid[0]) + abs(s.y - last_valid[1]))
-                if dj > self._atk_jump_threshold:
+                # 2026-06-10: > → >= (경계 포함). healer-37 (7) 사고에서 오염
+                # 점프 (6,1)→(3,6)이 d=8로 임계 8과 같아 d>8 미충족 → 통과.
+                # 실측 정상 push 간 델타 ≤5 (30Hz 수신, 1Hz 로그 기준)라 안전.
+                if dj >= self._atk_jump_threshold:
                     if self.log is not None:
                         self.log.debug(
                             f"[ATK-COORD-JUMP] map={s.map_name!r} "
@@ -398,7 +584,8 @@ class Follower:
                 if push_ok and trail and len(trail) > 0:
                     px, py = trail[-1]
                     d_jump = abs(coord[0] - px) + abs(coord[1] - py)
-                    if d_jump > self._jump_reject_threshold:
+                    # 2026-06-10: > → >= (수정 ③과 동일 — 경계값 d=8 통과 버그).
+                    if d_jump >= self._jump_reject_threshold:
                         push_ok = False
                         reject_reason = (
                             f"jump last={trail[-1]} d={d_jump} "
@@ -543,6 +730,60 @@ class Follower:
                 self._exit_dir = g_clean_exit_dir
                 if g_clean_exit_coord is not None:
                     self._exit_coord = g_clean_exit_coord
+            # 경계 기반 출구점 (2026-06-10): trail 관측 bbox 경계에 닿은
+            # 마지막 점을 출구로. 마지막 1~2점 OCR 노이즈((4,7)류)에 강건 —
+            # 2점 델타/global 계산을 최우선 override.
+            b_coord, b_dir, b_idx = self._boundary_exit(old_trail)
+            if b_dir is not None:
+                if self.log is not None and (b_dir != self._exit_dir
+                                             or b_coord != self._exit_coord):
+                    self.log.info(
+                        f"[EXIT-BOUNDARY] override dir "
+                        f"{self._exit_dir!r}→{b_dir!r} "
+                        f"coord {self._exit_coord}→{b_coord}"
+                    )
+                self._exit_dir = b_dir
+                self._exit_coord = b_coord
+                # EXIT-TRIM (2026-06-10): 경계점 이후 점들은 맵명 OCR 지연 창
+                # (~1.5s)에 들어온 새 맵 좌표가 옛 맵명으로 push된 오염.
+                # 안 자르면 B1 exit_dash가 가짜 trail 끝점을 추종
+                # (healer-37 (7) 사고: (7,1) 뒤 (6,1),(3,6),(4,6) 오염 →
+                # 힐러가 (4,6) 추종, 포탈 x=7 못 가고 28s 정체).
+                # 경계점==출구이므로 그 뒤를 잘라 trail 끝점==출구좌표 보장.
+                # old_trail은 _map_trail의 deque 그 자체 → in-place 절단으로
+                # 다음 랩 재방문 시에도 깨끗한 trail 유지.
+                n_trim = len(old_trail) - 1 - b_idx
+                if n_trim > 0:
+                    for _ in range(n_trim):
+                        old_trail.pop()
+                    if self.log is not None:
+                        self.log.info(
+                            f"[EXIT-TRIM] map={self._exit_map!r} "
+                            f"경계점 {b_coord} 이후 {n_trim}점 절단"
+                        )
+            # 포탈 DB: ① 이번 관측 기록(경계 정제값) ② 과거 누적(중앙값) 적용.
+            # 과거 데이터가 있으면 단발 노이즈/UDP 누락과 무관하게 정확한
+            # 포탈 좌표/방향으로 직행 (데이터 쌓일수록 정확).
+            self._portal_record(self._exit_map, s.map_name,
+                                self._exit_coord, self._exit_dir)
+            p_coord, p_dir = self.portal_lookup(self._exit_map, s.map_name)
+            if p_coord is not None:
+                if self.log is not None and (p_coord != self._exit_coord
+                                             or (p_dir != self._exit_dir
+                                                 and p_dir != "-")):
+                    self.log.info(
+                        f"[PORTAL-DB] {self._exit_map!r}→{s.map_name!r} "
+                        f"coord={p_coord} dir={p_dir!r} "
+                        f"(이번 관측 coord={self._exit_coord} "
+                        f"dir={self._exit_dir!r})"
+                    )
+                self._exit_coord = p_coord
+                if p_dir in ("L", "R", "U", "D"):
+                    self._exit_dir = p_dir
+            # EXIT-FALLBACK 리셋 — 새 전환 시작.
+            self._exit_fallback_n = 0
+            self._healer_coord_progress_ts = now
+            self._healer_coord_progress_base = None
             # 태그 전이 감지 = 격수 맵 전환 확정 → exit_dir 강제 홀드 창 개시.
             # 2026-04-22: pend_delay 지연 적용 — 격수 포탈 왕복 방지.
             self._force_exit_start = now + self._force_exit_pend_sec
@@ -697,6 +938,22 @@ class Follower:
             now = time.time()
         return max(0.0, self._force_exit_until - now)
 
+    def post_tab_grace_active(self, now: Optional[float] = None) -> bool:
+        """본인 빨탭 후 맵전환 직후 grace 창(흰탭 재arm 억제) 중인지 (수정A)."""
+        if now is None:
+            now = time.time()
+        return now < self._post_tab_grace_until
+
+    def cancel_force_exit(self) -> None:
+        """force_exit 홀드 즉시 해제 (2026-06-10).
+
+        도사가 격수와 같은 맵에 도달(map_neq=False)하면 exit_dir 강제 밀기의
+        목적(포탈 통과)이 달성됨 → 해제. 안 하면 force_exit 잔여 시간 동안
+        도사가 격수를 지나쳐 다음 포탈로 또 넘어가버림(혼자 포탈/뒤로 복귀 사고).
+        """
+        self._force_exit_until = 0.0
+        self._force_exit_start = 0.0
+
     def last_seen_in(self, map_name: str):
         """해당 맵에서 격수가 마지막으로 관측된 (coord, dir).
 
@@ -840,6 +1097,25 @@ class Follower:
         # cur 단조 증가 + snap-forward(thr=10) 지름길 방지 조합으로 "trail 순서대로
         # 밟기" 정책 유지됨. 끝 도달 후 exit_dir 밀기는 feedback_route_trail.md 정책.
         if cur >= last_idx:
+            # exit_dash 최종 목표 (2026-06-10): trail 끝점 대신 **보정된
+            # 출구좌표**(_exit_coord — EXIT-BOUNDARY/PORTAL-DB 반영값).
+            # trail 끝점은 오염 가능(EXIT-TRIM이 못 자른 케이스: 경계 미발견),
+            # _exit_coord는 보정 파이프라인 통과값이라 항상 우선.
+            # (healer-37 (7) 사고: exit=(7,1) 보정됐는데 추종은 raw 끝점
+            # (4,6) → 포탈 못 감. 보정값-추종 불일치 해소.)
+            if (exit_dash and self._exit_coord is not None
+                    and self._exit_map == map_name):
+                ex, ey = self._exit_coord
+                d_to_exit = abs(ex - hx) + abs(ey - hy)
+                if d_to_exit > tol:
+                    base_diag["wp"] = (ex, ey)
+                    base_diag["d"] = d_to_exit
+                    base_diag["reason"] = "exit_dash_portal"
+                    self._wp_last_diag = base_diag
+                    return ((ex, ey), self._exit_dir or "-")
+                base_diag["reason"] = "end_reached"
+                self._wp_last_diag = base_diag
+                return None
             # exit_dash 중이고 아직 last_idx에 도달 못 했으면 wp 계속 반환.
             # (None 반환 시 caller가 exit_dir 밀기 fallback → 포탈 좌표 아닌
             # 방향키만 눌려 엉뚱한 곳으로 갈 수 있음)

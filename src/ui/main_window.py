@@ -24,14 +24,10 @@ from .region_picker import RegionPicker
 from .region_overlay import RegionOverlay
 from .status_strip import StatusStrip
 from .dialogs import SkillDialog, ParamDialog, NetworkDialog
-# 2026-04-25: v2 facade 로 redirect — v1 worker class 호출 금지.
-# src_v2.workers.v1_compat 의 HealerWorkerV1Facade / AttackerWorkerV1Facade 가
-# v1 main_window 의 모든 attribute / signal / method 인터페이스를 그대로 노출하면서
-# 내부에서 HealerWorkerV2 / AttackerWorkerV2 를 자체 동작시킨다.
-from src_v2.workers.v1_compat import (
-    HealerWorkerV1Facade as HealerWorker,
-    AttackerWorkerV1Facade as AttackerWorker,
-)
+# 2026-06-07: v2 facade redirect 제거 — 순수 v1 워커 직접 사용 (사용자 요청).
+# v1 healer_worker / attacker_worker 가 실제 동작. src_v2 미경유.
+from ..workers.healer_worker import HealerWorker
+from ..workers.attacker_worker import AttackerWorker
 from ..workers.heartbeat import HealerHeartbeat, AttackerHeartbeat
 from ..workers.control_listener import ControlListener
 
@@ -90,6 +86,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.skill_chks = self.skill_dlg.skill_chks
         self.skill_spins = self.skill_dlg.skill_spins
         self.parlyuk_spin = self.skill_dlg.parlyuk_spin
+        self.parlyuk_maps_edit = self.skill_dlg.parlyuk_maps_edit
         self.conf_slider = self.param_dlg.conf_slider
         self.conf_label = self.param_dlg.conf_label
         self.minw_spin = self.param_dlg.minw_spin
@@ -191,6 +188,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 lambda v, n=name: self._on_skill_vk(n, v)
             )
         self.parlyuk_spin.valueChanged.connect(self._on_parlyuk_offset)
+        self.parlyuk_maps_edit.textChanged.connect(self._on_parlyuk_maps)
         self.skill_dlg.btn_nl_off.clicked.connect(self._on_numlock_off)
         # 메인힐 NumPad 번호 변경 → 워커 skill_vks["메인힐"] 갱신 + 싸이클 재계산.
         try:
@@ -199,11 +197,8 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         except Exception:
             pass
-        # 임계치 (자힐 HP%, 공력증강 MP%) 변경 → 워커 instance var 업데이트.
+        # 임계치 (공력증강 MP%) 변경 → 워커 instance var 업데이트.
         try:
-            self.skill_dlg.self_heal_hp_spin.valueChanged.connect(
-                self._on_self_heal_thr_changed
-            )
             self.skill_dlg.gyoungryeok_mp_spin.valueChanged.connect(
                 self._on_gyoungryeok_thr_changed
             )
@@ -255,11 +250,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # 2026-04-20: 공력증강/부활 추가 — 모두 조건부 스케줄러 시전.
         _SCHEDULED = {
             "파력무참", "백호의희원", "백호의희원첨",
-            "파혼술", "공력증강", "부활",
-            # 2026-04-21: 무장/보호는 Shift+Z 키 시퀀스라 NumLock 싸이클 외.
-            "무장", "보호",
-            # 2026-04-22: 자힐도 스케줄러 edge-cast (메인힐 VK burst) → 싸이클 외.
-            "자힐",
+            "공력증강", "부활",
         }
         for name, chk in self.skill_chks.items():
             if name in _SCHEDULED:
@@ -410,6 +401,13 @@ class MainWindow(QtWidgets.QMainWindow):
         run_row.addWidget(self.chk_follow_only)
         run_row.addStretch(1)
         root.addLayout(run_row)
+
+        # 클라우드 패널 (설정 sync + 자동 업데이트). 미설정이면 조용히 비활성.
+        try:
+            from . import cloud_panel
+            cloud_panel.attach(self, root)
+        except Exception:
+            pass
 
         # 격수 전용 힐러 제어 패널.
         self.attacker_panel = QtWidgets.QGroupBox("힐러 제어")
@@ -751,30 +749,6 @@ class MainWindow(QtWidgets.QMainWindow):
         de_row3.addWidget(self.lbl_buff_region, 1)
         de_row3_w = QtWidgets.QWidget(); de_row3_w.setLayout(de_row3)
         de_lay.addWidget(de_row3_w)
-        # 2026-04-21: 채팅 하단 "자리 바꿀 아이템" 감지 영역.
-        # 보호/무장 Shift+Z+C/X 시전 후 이 영역에 글자 감지되면 ESC 자동 송신.
-        de_row4 = QtWidgets.QHBoxLayout()
-        de_row4.setSpacing(4)
-        self.btn_chat_region = QtWidgets.QPushButton("채팅 영역")
-        self.btn_chat_region.setMinimumWidth(72)
-        self.btn_chat_region.setToolTip(
-            "보호/무장 시전 후 '자리 바꿀 아이템' 팝업 뜨면 ESC 자동 송신.\n"
-            "채팅창 하단 입력줄 영역을 드래그로 지정."
-        )
-        self.btn_chat_region.clicked.connect(self._on_pick_chat_region)
-        self.btn_chat_region_clear = QtWidgets.QPushButton("해제")
-        self.btn_chat_region_clear.setMinimumWidth(46)
-        self.btn_chat_region_clear.setMaximumWidth(60)
-        self.btn_chat_region_clear.clicked.connect(
-            self._on_clear_chat_region
-        )
-        self.lbl_chat_region = QtWidgets.QLabel("채팅 영역: 미지정")
-        self.lbl_chat_region.setObjectName("mutedLabel")
-        de_row4.addWidget(self.btn_chat_region)
-        de_row4.addWidget(self.btn_chat_region_clear)
-        de_row4.addWidget(self.lbl_chat_region, 1)
-        de_row4_w = QtWidgets.QWidget(); de_row4_w.setLayout(de_row4)
-        de_lay.addWidget(de_row4_w)
         # 2026-04-20: 혼마술 전용 영역 rollback (버프 영역 = 혼마술 영역 공용).
         # 격수 PC 에서 "버프 영역" 으로 파력무참/혼마술 동시 OCR.
         # HP/MP 확인 버튼 (픽셀 리더 1회 실행 → %표시).
@@ -1995,53 +1969,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
         self._refresh_region_overlay()
 
-    def _on_pick_chat_region(self) -> None:
-        """채팅창 하단 '자리 바꿀 아이템' 감지 영역 드래그."""
-        if self._region_picker is not None:
-            try:
-                self._region_picker.close()
-            except Exception:
-                pass
-        self._region_picker = RegionPicker()
-        self._region_picker.region_selected.connect(
-            self._on_chat_region_selected
-        )
-        self._region_picker.cancelled.connect(
-            lambda: self._append_log("[채팅 영역] 취소")
-        )
-        self._region_picker.showFullScreen()
-        self._append_log("[채팅 영역] 드래그로 선택 (ESC=취소)")
-
-    def _on_chat_region_selected(
-        self, x: int, y: int, w: int, h: int
-    ) -> None:
-        self.cfg.cooldown.chat_region_x = int(x)
-        self.cfg.cooldown.chat_region_y = int(y)
-        self.cfg.cooldown.chat_region_w = int(w)
-        self.cfg.cooldown.chat_region_h = int(h)
-        self.lbl_chat_region.setText(f"채팅 영역: ({x},{y}) {w}×{h}")
-        self._append_log(f"[채팅 영역] 설정 ({x},{y}) {w}×{h}")
-        if self.worker and hasattr(self.worker, "set_chat_region"):
-            try:
-                self.worker.set_chat_region(x, y, w, h)
-            except Exception as e:
-                self._append_log(f"[채팅 영역] 워커 반영 실패: {e}")
-        self._refresh_region_overlay()
-
-    def _on_clear_chat_region(self) -> None:
-        self.cfg.cooldown.chat_region_x = -1
-        self.cfg.cooldown.chat_region_y = -1
-        self.cfg.cooldown.chat_region_w = 0
-        self.cfg.cooldown.chat_region_h = 0
-        self.lbl_chat_region.setText("채팅 영역: 미지정")
-        self._append_log("[채팅 영역] 해제")
-        if self.worker and hasattr(self.worker, "clear_chat_region"):
-            try:
-                self.worker.clear_chat_region()
-            except Exception:
-                pass
-        self._refresh_region_overlay()
-
     def _on_test_xp_ocr(self) -> None:
         """경험치 영역을 한 번 캡처해 OCR 시도 → 결과 다이얼로그 표시.
 
@@ -2637,11 +2564,16 @@ class MainWindow(QtWidgets.QMainWindow):
         lbl.update()
 
     def _on_follow_only(self, state):
-        """따라가기 전용 토글. 스킬/빨탭/TAB-CONFIRM 전부 OFF."""
+        """따라가기 토글. 스킬 OFF + 경량 모드(빨탭 YOLO + cooldown/buff/hp/mp
+        OCR 정지). 유지: coord/맵 OCR(이동) + 경험치 OCR + 격수 좌표 추종.
+        저사양 대응."""
         on = (state == QtCore.Qt.Checked)
-        if self.worker and hasattr(self.worker, "follow_only"):
-            self.worker.follow_only = on
-        self._append_log(f"FOLLOW-ONLY={'ON' if on else 'OFF'}")
+        if self.worker:
+            if hasattr(self.worker, "follow_only"):
+                self.worker.follow_only = on
+            if hasattr(self.worker, "follow_light"):
+                self.worker.follow_light = on
+        self._append_log(f"FOLLOW(경량)={'ON' if on else 'OFF'}")
 
     def _on_toggle_low_spec(self, state) -> None:
         """저사양 모드 토글. YOLO 주기/해상도, 프리뷰 주기, OCR poll 일괄 조정.
@@ -2722,13 +2654,18 @@ class MainWindow(QtWidgets.QMainWindow):
         # 스케줄러 전담 스킬은 NumLock 싸이클과 무관 → 갱신 불필요.
         if name not in (
             "파력무참", "백호의희원", "백호의희원첨",
-            "파혼술", "공력증강", "부활", "무장", "보호", "자힐",
+            "공력증강", "부활",
         ):
             self._on_cycle_changed()
 
     def _on_parlyuk_offset(self, v: int):
         if self.worker and hasattr(self.worker, "set_parlyuk_offset"):
             self.worker.set_parlyuk_offset(float(v))
+
+    def _on_parlyuk_maps(self, text: str):
+        """파력무참 시전 굴 설정 → 워커 반영 (2026-06-10)."""
+        if self.worker and hasattr(self.worker, "set_parlyuk_maps"):
+            self.worker.set_parlyuk_maps(text)
 
     def _on_mainheal_vk_changed(self, n: int):
         """메인힐 NumPad 번호 변경 — 워커 skill_vks 갱신 + 싸이클 재계산.
@@ -2745,15 +2682,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._append_log(f"[SLOT] 메인힐 = NumPad{n}")
         # NumLock 싸이클 VK 재계산 (메인힐은 싸이클 슬롯이므로).
         self._on_cycle_changed()
-
-    def _on_self_heal_thr_changed(self, v: int):
-        """자힐 HP% 임계치 변경 → 워커 인스턴스 변수 갱신 (재시작 불필요)."""
-        if self.worker and hasattr(self.worker, "self_heal_hp_thr"):
-            try:
-                self.worker.self_heal_hp_thr = int(v)
-            except Exception:
-                pass
-        self._append_log(f"[THR] 자힐 HP% = {v}")
 
     def _on_gyoungryeok_thr_changed(self, v: int):
         """공력증강 MP% 임계치 변경 → 워커 인스턴스 변수 갱신."""
@@ -3516,9 +3444,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker = HealerWorker(self.cfg)
         self.worker.armed = self.chk_arm.isChecked()
         self.worker.follow_only = self.chk_follow_only.isChecked()
+        self.worker.follow_light = self.chk_follow_only.isChecked()
         self.worker.min_w = self.minw_spin.value()
         self.worker.min_h = self.minh_spin.value()
         self.worker.coord_tol = self.tol_spin.value()
+        self.worker.set_parlyuk_maps(self.parlyuk_maps_edit.text())
         self.worker.yolo_conf = self.conf_slider.value() / 100.0
         self.worker.yolo_every_n = self.yn_spin.value()
         # 스킬 토글/오프셋/VK 초기값 주입 (스케줄러/싸이클러 생성 전에 반영).
@@ -3539,11 +3469,8 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         except Exception:
             pass
-        # 자힐/공력증강 임계치 주입 (default_skills 호출 전에 반영 필수).
+        # 공력증강 임계치 주입 (default_skills 호출 전에 반영 필수).
         try:
-            self.worker.self_heal_hp_thr = int(
-                self.skill_dlg.self_heal_hp_spin.value()
-            )
             self.worker.gyoungryeok_mp_thr = int(
                 self.skill_dlg.gyoungryeok_mp_spin.value()
             )
@@ -3862,6 +3789,12 @@ class MainWindow(QtWidgets.QMainWindow):
         load(self)
 
     def closeEvent(self, ev):
+        # 종료 시 디버그 로그 자동 업로드 (클라우드 미설정이면 조용히 skip).
+        try:
+            from . import cloud_panel
+            cloud_panel.auto_upload_log(self)
+        except Exception:
+            pass
         # 설정 자동 저장.
         try:
             self._save_settings()

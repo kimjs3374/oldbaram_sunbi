@@ -46,95 +46,11 @@ KEYEVENTF_EXTENDEDKEY = 0x0001
 VK_ESCAPE = 0x1B
 VK_HOME = 0x24
 VK_TAB = 0x09
-VK_SHIFT = 0x10
-VK_Z = 0x5A
-VK_C = 0x43
-VK_X = 0x58
 
 # Numpad VK (numlock_cycle.NUMPAD_VK_MAP 와 일치).
 _VK_NUMPAD1 = 0x61  # 메인힐 (자힐).
 _VK_NUMPAD6 = 0x66  # 부활.
 
-
-def _send_key_tap(vk: int, ms: float = 0.04) -> None:
-    """단일 키 down→up tap. extended flag 없음."""
-    scan = user32.MapVirtualKeyW(vk, 0)
-    _keybd(vk, scan, 0, 0)
-    time.sleep(max(0.02, ms))
-    _keybd(vk, scan, KEYEVENTF_KEYUP, 0)
-
-
-def cast_shift_z_then(second_vk: int,
-                      log_fn: Optional[Callable[[str], None]] = None,
-                      label: str = "",
-                      cycler=None) -> None:
-    """공용 시퀀스: [Shift+Z] → [Shift+<second_vk>] 두 개 **독립** 조합.
-
-    2026-04-21: Shift 유지한 채 Z→C 연속 tap 방식은 게임에서 "단축키 자리
-    바꾸기 모드(자리 바꿀 아이템[a-Z,a-Z])" 로 해석되어 채팅창 오염 유발.
-    각 조합을 Shift down→키 tap→Shift up 으로 완전히 분리 송신해야 함.
-
-    cycler (있으면) 일시 suspend — Shift 눌린 동안 cycler 의 NumPad scan
-    press 와 충돌 시 "Shift+숫자" 로 오인되어 메인힐 토글 깨지는 문제 방지.
-    """
-    shift_scan = user32.MapVirtualKeyW(VK_SHIFT, 0)
-
-    def _shift_combo(vk2: int, lbl: str) -> None:
-        # Shift down → vk2 tap → Shift up. 한 조합 = 한 번 완결.
-        _keybd(VK_SHIFT, shift_scan, 0, 0)
-        time.sleep(0.04)
-        _send_key_tap(vk2, ms=0.04)
-        time.sleep(0.04)
-        _keybd(VK_SHIFT, shift_scan, KEYEVENTF_KEYUP, 0)
-        if log_fn:
-            log_fn(f"[BUFF-CAST] {lbl}")
-
-    if cycler is not None:
-        try:
-            cycler.suspend()
-            if log_fn:
-                log_fn(f"[BUFF-CAST] {label} cycler suspend (Shift 충돌 방지)")
-        except Exception:
-            pass
-    try:
-        if log_fn:
-            log_fn(
-                f"[BUFF-CAST] {label} [Shift+Z] → [Shift+{hex(second_vk)}]"
-            )
-        # 1) Shift+Z 조합 완결.
-        _shift_combo(VK_Z, f"{label} Shift+Z")
-        # 2) 두 조합 사이 간격 — 게임이 이전 Shift up 을 확실히 처리한 뒤
-        #    두 번째 조합 시작. 자리 바꾸기 모드 미진입 보장.
-        time.sleep(0.12)
-        # 3) Shift+second_vk 조합 완결.
-        _shift_combo(
-            second_vk, f"{label} Shift+{hex(second_vk)}"
-        )
-    finally:
-        # 안전장치: 이탈 시점 Shift 가 눌려있을 가능성 제거 (예외/중단 대비).
-        try:
-            _keybd(VK_SHIFT, shift_scan, KEYEVENTF_KEYUP, 0)
-        except Exception:
-            pass
-        if cycler is not None:
-            try:
-                cycler.resume()
-                if log_fn:
-                    log_fn(f"[BUFF-CAST] {label} cycler resume")
-            except Exception:
-                pass
-
-
-def cast_mujang(log_fn: Optional[Callable[[str], None]] = None,
-                cycler=None) -> None:
-    """무장 시전: Shift+Z → Shift+C."""
-    cast_shift_z_then(VK_C, log_fn=log_fn, label="무장", cycler=cycler)
-
-
-def cast_boho(log_fn: Optional[Callable[[str], None]] = None,
-              cycler=None) -> None:
-    """보호 시전: Shift+Z → Shift+X."""
-    cast_shift_z_then(VK_X, log_fn=log_fn, label="보호", cycler=cycler)
 
 # 키 사이 기본 간격 (ms).
 _KEY_INTERVAL_MS = 80

@@ -7,18 +7,43 @@
 - 파력무참       : 180s 고정 쿨, buff OCR "파력무참" 으로 시전 검증.
 - 백호의희원      : 쿨 OCR 기반, 쿨 관측될 때까지 burst 반복.
 - 백호의희원첨     : 위와 동일.
-- 파혼술         : 쿨 없음. buff OCR 에 "혼마술" 보이면 즉시 burst.
-- 자힐           : self HP% < 임계치. pre=블록A, post=블록B. 메인힐 vk 재사용.
 - 공력증강        : self MP% < 임계치. 자체 VK. A/B 불필요.
 - 자가부활        : self HP% == 0. pre=블록A, post=블록B → 자힐.
 - 격수부활        : attacker HP% == 0 AND self HP%>0. A/B 불필요.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Union
 
 from .numlock_cycle import VK_NUMPAD7, VK_NUMPAD8
+
+# 파력무참 시전 굴 판정: 맵명 끝 '(N)' 의 N 추출 ('선비족2-3(5)' → 5).
+_PARLYUK_SUB_RE = re.compile(r"\((\d+)\)\s*$")
+
+
+def _parlyuk_map_ok(ctx: dict, maps_getter) -> bool:
+    """파력무참 시전 허용 맵인지 (2026-06-10 사용자 요청).
+
+    maps_getter() 가 빈 집합/None → 전체 굴 허용(기존 동작).
+    설정돼 있으면 현재 맵명 끝 '(N)' 의 N 이 그 집합에 있을 때만 허용.
+    예: 설정 {3,5} → '선비족2-3(5)'(N=5) 허용, '선비족2-3(2)'(N=2) 차단.
+    """
+    try:
+        maps = maps_getter() if callable(maps_getter) else maps_getter
+    except Exception:
+        maps = None
+    if not maps:
+        return True  # 미설정 = 전체 허용
+    m = ctx.get("map_name") or ""
+    mt = _PARLYUK_SUB_RE.search(m)
+    if not mt:
+        return False
+    try:
+        return int(mt.group(1)) in maps
+    except Exception:
+        return False
 
 
 # NumPad0~9 VK 코드 (0x60 ~ 0x69). blueprints 기본 VK 지정용.
@@ -112,32 +137,6 @@ def _buff_present(ctx: dict, key: str) -> bool:
         return False
 
 
-def _attacker_debuff_present(ctx: dict, key: str) -> bool:
-    """`ctx["attacker_buffs"][key]` 가 0 초과면 True.
-
-    감지는 격수 PC, 시전은 힐러 PC. 격수가 UDP State.debuff_honmasul_sec 로
-    혼마술 잔여 초를 실어 보내고 힐러 워커가 ctx["attacker_buffs"] 로 주입.
-    """
-    try:
-        pool = ctx.get("attacker_buffs") or {}
-        return int(pool.get(key, -1)) > 0
-    except Exception:
-        return False
-
-
-def _attacker_buff_missing(ctx: dict, key: str) -> bool:
-    """격수 버프 key 가 **확정적으로** 없으면 True.
-    - 0 = OCR 돌았고 keyword 없음 → True (시전)
-    - 1 = OCR 돌았고 keyword 있음 → False (시전 X)
-    - -1 = OCR 미수행 → False (모름, 시전 X, 안전)
-    """
-    try:
-        pool = ctx.get("attacker_buffs") or {}
-        return int(pool.get(key, -1)) == 0
-    except Exception:
-        return False
-
-
 def _self_hp_below(ctx: dict, thr_getter) -> bool:
     """힐러 본인 HP% < threshold. HP 미관측(-1)이면 False.
 
@@ -162,6 +161,42 @@ def _self_mp_below(ctx: dict, thr_getter) -> bool:
         return mp < thr
     except Exception:
         return False
+
+
+def _gyoungryeok_hysteresis(ctx, start_thr_getter,
+                            active_getter, active_setter,
+                            done_pct: int = 90) -> bool:
+    """공력증강 hysteresis (2026-06-10 사용자 요청).
+
+    MP% < 시작임계 → 시전 시작(active ON). 이후 MP%가 done_pct(90%)에
+    도달할 때까지 계속 시전 → 90% 미달이면 재시도, 90%+ 되면 완료(active OFF).
+    기존(_self_mp_below)은 임계 한순간만 True → 임계 바로 위(예 31%)에서
+    멈춰 공증이 덜 채워짐. hysteresis 로 "임계 아래 시작 → 90% 완료" 보장.
+    active 상태는 worker 가 보유(getter/setter), scheduler 단일스레드 평가.
+    """
+    try:
+        mp = int(ctx.get("self_mp_pct", -1))
+    except Exception:
+        return False
+    if mp < 0:
+        return False  # MP 미관측 — 상태 유지(시전 안 함)
+    active = bool(active_getter()) if active_getter else False
+    if active:
+        if mp >= done_pct:
+            if active_setter:
+                active_setter(False)
+            return False  # 90% 도달 → 공증 완료
+        return True       # 진행 중 — 90%까지 계속
+    try:
+        start = int(start_thr_getter() if callable(start_thr_getter)
+                    else start_thr_getter)
+    except Exception:
+        return False
+    if mp < start:
+        if active_setter:
+            active_setter(True)
+        return True       # 시작
+    return False
 
 
 def _self_dead(ctx: dict) -> bool:
@@ -191,9 +226,9 @@ def default_skills(parlyuk_offset_sec: float = 0.0,
                    post_block_b: Optional[Callable[[dict], None]] = None,
                    post_self_resurrect: Optional[Callable[[dict], None]] = None,
                    pre_block_ab: Optional[Callable[[dict], None]] = None,
-                   cast_mujang_hook: Optional[Callable[[dict], None]] = None,
-                   cast_boho_hook: Optional[Callable[[dict], None]] = None,
-                   cast_parhon_hook: Optional[Callable[[dict], None]] = None,
+                   parlyuk_maps_getter: Optional[Callable[[], set]] = None,
+                   gyoung_active_getter: Optional[Callable[[], bool]] = None,
+                   gyoung_active_setter: Optional[Callable[[bool], None]] = None,
                    ) -> list:
     """힐러 조건부 스킬.
 
@@ -251,33 +286,9 @@ def default_skills(parlyuk_offset_sec: float = 0.0,
         edge_only=True,
     ))
 
-    # 자힐 — self HP% < 임계치. pre_block_ab 가 A+B 통합 시퀀스 실행.
-    # block A 안에 자힐 burst 포함되어 있으므로 main burst 불필요 (burst_sec=0).
-    # 임계치는 callable 이면 매 predicate 호출 시 실시간 값 조회 (스피너 반영).
-    # 2026-04-20 Patch 2.18: cooldown_sec 4.0 → 0.0. HP 가 임계치 아래로
-    # 유지되면 매 tick predicate 재평가 → 즉시 재발동. HpMpReader event push
-    # (poll_sec 0.1s + notify_tick) 로 실제 지연은 OCR 시간 수준.
-    # blocks_movement=True 가 시전 중 재진입 자동 차단 (동일 스레드).
-    _self_heal_thr_initial = (
-        int(self_heal_hp_thr()) if callable(self_heal_hp_thr)
-        else int(self_heal_hp_thr)
-    )
-    skills.append(SkillSpec(
-        "자힐",
-        mainheal_vk,
-        0.0,
-        lambda c, _g=self_heal_hp_thr: _self_hp_below(c, _g),
-        verify_kind=None,
-        burst_sec=0,  # pre_block_ab 가 전체 시퀀스 담당.
-        burst_interval_sec=0.1,
-        retry_max=1,
-        pre_block=pre_block_ab,
-        post_block=None,
-        priority=2,
-        threshold=_self_heal_thr_initial,
-        blocks_movement=True,
-        edge_only=True,
-    ))
+    # 자힐 — 2026-06-07 사용자 요청으로 완전 제거. self HP% 가 낮아도 힐러가
+    # self-target 후 자기 자신을 힐하는 동작 없음. (자가부활/공력증강은 유지.)
+    # 메인힐 VK 는 NumLock 싸이클(격수 힐)로만 사용.
 
     # 공력증강 — MP% < 임계치. 조건부 전환 (기존 NumLock 싸이클 제외).
     # 임계치 callable 지원.
@@ -292,14 +303,19 @@ def default_skills(parlyuk_offset_sec: float = 0.0,
         "공력증강",
         int(vk_map.get("공력증강", _VK_NUMPAD3)),
         0.0,
-        lambda c, _g=gyoungryeok_mp_thr: _self_mp_below(c, _g),
+        lambda c, _g=gyoungryeok_mp_thr: _gyoungryeok_hysteresis(
+            c, _g, gyoung_active_getter, gyoung_active_setter),
         verify_kind=None,
         burst_sec=1.0,
         burst_interval_sec=0.1,
         retry_max=2,
         priority=3,
         threshold=_gyoung_thr_initial,
-        edge_only=True,
+        # 2026-06-11 버그수정: edge_only=True 면 scheduler polling 에서 skip
+        # (request_cast 로만 시전)되는데 worker 가 공증 request_cast 를 안 해
+        # predicate(hysteresis) 가 0회 호출 → 공증 0회 시전. False 로 바꿔
+        # polling 에서 매 tick hysteresis 평가 (MP<임계 시작 → 90% 도달까지 반복).
+        edge_only=False,
     ))
 
     # 파력무참: buff OCR 에서 "파력무참" 관측될 때까지 재시전. 백호의희원 방식.
@@ -308,7 +324,8 @@ def default_skills(parlyuk_offset_sec: float = 0.0,
     # 부재 → 재진입. cooldown_sec=5 는 verify GIVEUP 시 backoff (백호 방식).
     skills.append(SkillSpec(
         "파력무참", int(vk_map.get("파력무참", _VK_NUMPAD8)),
-        5.0, lambda c: not _buff_present(c, "파력무참"),
+        5.0, lambda c: (not _buff_present(c, "파력무참")
+                        and _parlyuk_map_ok(c, parlyuk_maps_getter)),
         offset_sec=parlyuk_offset_sec,
         verify_kind="buff",
         verify_target="파력무참",
@@ -339,20 +356,6 @@ def default_skills(parlyuk_offset_sec: float = 0.0,
         priority=11,
     ))
 
-    # 파혼술 — 혼마술 감지 시 즉시 burst. 크로스-PC 트리거.
-    # 2026-04-21: press_normal_vk 가 NumPad→main 숫자 변환해 게임이 안 먹던
-    # 버그 수정. pre_block=cast_parhon_hook 로 NumPad scan 직접 송신.
-    skills.append(SkillSpec(
-        "파혼술", int(vk_map.get("파혼술", _VK_NUMPAD7)),
-        0.0, lambda c: _attacker_debuff_present(c, "혼마술"),
-        verify_kind=None,
-        burst_sec=0,  # pre_block 이 burst 담당.
-        retry_max=1,
-        pre_block=cast_parhon_hook,
-        priority=4,
-        edge_only=True,
-    ))
-
     # 금강불체 — 옵션 (기본 off). 쿨 없음. 활성화 시 edge 트리거 or 수동 호출.
     skills.append(SkillSpec(
         "금강불체", int(vk_map.get("금강불체", _VK_NUMPAD0)),
@@ -363,34 +366,6 @@ def default_skills(parlyuk_offset_sec: float = 0.0,
         retry_max=1,
         priority=12,
         edge_only=True,
-    ))
-
-    # 무장 — 격수 버프 "무장" 없을 때 Shift+Z → Shift+C 시퀀스.
-    # edge_only=False + cooldown_sec=15 로 edge (즉시) + polling (15s 재시도)
-    # 이중 동작. 격수 buff OCR 이 한 번 실패해도 다음 polling 때 재시전.
-    skills.append(SkillSpec(
-        "무장", 0, 15.0,
-        lambda c: _attacker_buff_missing(c, "무장"),
-        verify_kind=None,
-        burst_sec=0,
-        retry_max=1,
-        pre_block=cast_mujang_hook,
-        post_block=None,
-        priority=5,
-        edge_only=False,
-    ))
-
-    # 보호 — 격수 버프 "보호" 없을 때 Shift+Z → Shift+X 시퀀스.
-    skills.append(SkillSpec(
-        "보호", 0, 15.0,
-        lambda c: _attacker_buff_missing(c, "보호"),
-        verify_kind=None,
-        burst_sec=0,
-        retry_max=1,
-        pre_block=cast_boho_hook,
-        post_block=None,
-        priority=5,
-        edge_only=False,
     ))
 
     return skills

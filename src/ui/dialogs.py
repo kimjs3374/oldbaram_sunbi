@@ -20,15 +20,15 @@ class SkillDialog(QtWidgets.QDialog):
 
     2026-04-20 VK 재배치:
     - 메인힐=1 (봉황/신령 택1 통합), 혼마술=2, 공력증강=3,
-      백호=4, 백호첨=5, 부활=6, 파혼술=7, 파력무참=8, 금강불체=0.
+      백호=4, 백호첨=5, 부활=6, 파력무참=8, 금강불체=0.
     - NumLock 싸이클 슬롯: 메인힐 + 혼마술 (공력증강은 조건부로 이동).
-    - 조건부 스킬: 백호/백호첨/공력증강/부활/파혼술/파력무참/금강불체.
-    - 임계치: 자힐 HP%, 공력증강 MP% (부활은 HP==0 고정).
+    - 조건부 스킬: 백호/백호첨/공력증강/부활/파력무참/금강불체.
+    - 임계치: 공력증강 MP% (부활은 HP==0 고정).
 
     속성 (main_window 의존):
       spin_mainheal, rb_bonghwang, rb_shinryoung, spin_honmasul, chk_honmasul,
       skill_chks[name], skill_spins[name], parlyuk_spin,
-      self_heal_hp_spin, gyoungryeok_mp_spin, btn_nl_off.
+      gyoungryeok_mp_spin, btn_nl_off.
     """
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -74,17 +74,12 @@ class SkillDialog(QtWidgets.QDialog):
         # name, default_on, default_vk, has_vk.
         # has_vk=False → VK 스피너 없음 (키 시퀀스 하드코딩, 사용자 변경 불가).
         defaults = [
-            ("자힐", True, 0, False),       # HP% 미만일 때 메인힐 VK 재사용.
             ("백호의희원", True, 4, True),
             ("백호의희원첨", True, 5, True),
             ("공력증강", True, 3, True),    # MP% 임계치로 조건부 전환.
             ("부활", True, 6, True),        # 자가부활(자기 HP=0) + 격수부활.
-            ("파혼술", True, 7, True),       # 혼마술 디버프 감지 시 자동 시전.
             ("파력무참", True, 8, True),
             ("금강불체", False, 0, True),
-            # 2026-04-21: 격수 버프 재시전. 키는 Shift+Z → Shift+C/X 고정.
-            ("무장", True, 0, False),        # Shift+Z → Shift+C
-            ("보호", True, 0, False),        # Shift+Z → Shift+X
         ]
         for i, (name, on, vk_default, has_vk) in enumerate(defaults):
             c = QtWidgets.QCheckBox(name)
@@ -99,11 +94,7 @@ class SkillDialog(QtWidgets.QDialog):
                 self.skill_spins[name] = sp
             else:
                 # 키 시퀀스 고정 스킬은 설명 라벨.
-                info = {
-                    "무장": "Shift+Z → Shift+C",
-                    "보호": "Shift+Z → Shift+X",
-                    "자힐": "HP% 미만일 때 메인힐 VK로 burst",
-                }.get(name, "")
+                info = {}.get(name, "")
                 sl2.addWidget(QtWidgets.QLabel(info), i, 1, 1, 2)
         # 파력무참 오프셋.
         self.parlyuk_spin = QtWidgets.QSpinBox()
@@ -111,6 +102,16 @@ class SkillDialog(QtWidgets.QDialog):
         sl2.addWidget(QtWidgets.QLabel("파력무참 오프셋(s)"),
                       len(defaults), 0)
         sl2.addWidget(self.parlyuk_spin, len(defaults), 1, 1, 2)
+        # 파력무참 시전 굴 (2026-06-10): 맵명 끝 (N) 의 N 목록. 예 '3,5'.
+        self.parlyuk_maps_edit = QtWidgets.QLineEdit()
+        self.parlyuk_maps_edit.setPlaceholderText("예: 3,5 (비우면 전체 굴)")
+        self.parlyuk_maps_edit.setToolTip(
+            "파력무참을 특정 서브굴에서만 시전. 맵명 끝 (N) 의 N 을 쉼표로.\n"
+            "예: '3,5' → 선비족x-x(3), 선비족x-x(5) 에서만. 비우면 전체 굴."
+        )
+        sl2.addWidget(QtWidgets.QLabel("파력무참 시전 굴"),
+                      len(defaults) + 1, 0)
+        sl2.addWidget(self.parlyuk_maps_edit, len(defaults) + 1, 1, 1, 2)
         lay.addWidget(self.skill_box)
 
         # 타겟 시퀀스 박스 (F11/F12 동작 토글).
@@ -121,25 +122,20 @@ class SkillDialog(QtWidgets.QDialog):
         )
         self.chk_f11_ab_combined.setChecked(True)
         self.chk_f11_ab_combined.setToolTip(
-            "ON: F11 → 블록 A(자힐/부활) → 블록 B(격수 복귀 + 토글 재ON).\n"
+            "ON: F11 → 블록 A(부활) → 블록 B(격수 복귀 + 토글 재ON).\n"
             "OFF: F11 → 블록 A 만. 블록 B 는 F12 로 수동 실행."
         )
         sql.addWidget(self.chk_f11_ab_combined)
         lay.addWidget(self.seq_box)
 
-        # 임계치 박스 (자힐/공력증강).
+        # 임계치 박스 (공력증강).
         self.thr_box = QtWidgets.QGroupBox("임계치 (조건부 발동)")
         tl = QtWidgets.QGridLayout(self.thr_box)
-        tl.addWidget(QtWidgets.QLabel("자힐 HP (% 미만)"), 0, 0)
-        self.self_heal_hp_spin = QtWidgets.QSpinBox()
-        self.self_heal_hp_spin.setRange(1, 99)
-        self.self_heal_hp_spin.setValue(50)
-        tl.addWidget(self.self_heal_hp_spin, 0, 1)
-        tl.addWidget(QtWidgets.QLabel("공력증강 MP (% 미만)"), 1, 0)
+        tl.addWidget(QtWidgets.QLabel("공력증강 MP (% 미만)"), 0, 0)
         self.gyoungryeok_mp_spin = QtWidgets.QSpinBox()
         self.gyoungryeok_mp_spin.setRange(1, 99)
         self.gyoungryeok_mp_spin.setValue(30)
-        tl.addWidget(self.gyoungryeok_mp_spin, 1, 1)
+        tl.addWidget(self.gyoungryeok_mp_spin, 0, 1)
         lay.addWidget(self.thr_box)
 
         # 닫기 버튼.

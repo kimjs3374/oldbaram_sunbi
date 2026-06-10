@@ -151,6 +151,16 @@ class HpMpReader:
         self._hp_max: int = 0
         self._mp_max: int = 0
         self._rec = None
+        # 숫자 CNN (2026-06-10): 좌표 digit_cnn.onnx 재사용. 실측 HP/MP 99%
+        # (자릿수 손실 없음 — PaddleOCR 자릿수 누락/삽입 오독 해결). 세그+분류.
+        # 로드 실패/빈 결과면 아래 _rec(PaddleOCR) fallback.
+        self._digit_cnn = None
+        try:
+            from .digit_cnn import DigitCnn
+            _cnn_p = pathlib.Path(__file__).resolve().parent / "digit_cnn.onnx"
+            self._digit_cnn = DigitCnn(str(_cnn_p))
+        except Exception:
+            self._digit_cnn = None
         self._lock = threading.Lock()
         self._latest_frame: Optional[np.ndarray] = None
         self._latest_origin: Tuple[int, int] = (0, 0)
@@ -431,7 +441,7 @@ class HpMpReader:
             return
         updated = False
         if hp_r is not None:
-            cur, pct = self._ocr_region(frame, origin, hp_r, hp_mx)
+            cur, pct = self._ocr_region(frame, origin, hp_r, hp_mx, "hp")
             if cur is not None:
                 # 2026-04-24 OCR 오탐 필터: HP 숫자 OCR이 6자리 중 일부 자릿수를
                 # 놓쳐 값이 급감해 보이는 경우(예: 603541→190315→603541) 자힐
@@ -487,7 +497,7 @@ class HpMpReader:
                         )
                     self._prev_logged_hp_cur = cur_i
         if mp_r is not None:
-            cur, pct = self._ocr_region(frame, origin, mp_r, mp_mx)
+            cur, pct = self._ocr_region(frame, origin, mp_r, mp_mx, "mp")
             if cur is not None:
                 with self._lock:
                     self._last_mp_cur = int(cur)
@@ -514,19 +524,49 @@ class HpMpReader:
             except Exception:
                 pass
 
+    def _cnn_digits(self, up) -> str:
+        """전처리 이미지 → 숫자 CNN 세그+분류 → 숫자열. CNN 미사용시 ''.
+
+        좌표와 동일 _segment_digit_boxes + digit_cnn.predict. HP/MP 는 'cur/max'
+        결합이라 슬래시는 세그(높이필터)에서 제외되고 숫자 박스만 잡힘 →
+        _split_cur_max 가 max 기준 분리(기존 로직 재사용).
+        """
+        if self._digit_cnn is None or not self._digit_cnn.ready():
+            return ""
+        try:
+            from .ocr import _segment_digit_boxes
+            boxes = _segment_digit_boxes(up)
+            if not boxes:
+                return ""
+            patches = [up[y:y + h, x:x + w] for (x, y, w, h) in boxes]
+            labels = self._digit_cnn.predict(patches)
+            return "".join(str(d) for d in labels)
+        except Exception:
+            return ""
+
     def _ocr_region(self, frame, origin,
                     region: Tuple[int, int, int, int],
-                    max_val: int):
+                    max_val: int, kind: str = ""):
         crop = self._crop_abs(frame, region, origin)
         if crop is None or crop.size == 0:
             return None, None
         up = _preprocess_for_ocr(crop, upscale=3, thr=20)
+        # 1순위: 숫자 CNN 세그+분류 (자릿수 정확). 빈 결과면 PaddleOCR fallback.
+        digits = self._cnn_digits(up)
+        if not digits:
+            try:
+                res = self._rec.predict(up)
+            except Exception:
+                return None, None
+            raw_text = self._extract_text(res)
+            digits = re.sub(r"[^0-9]", "", raw_text or "")
+        # 숫자 CNN 학습 데이터 수집 (env OB_COLLECT_DIGITS=1 일 때만).
         try:
-            res = self._rec.predict(up)
+            from . import digit_collect
+            if digit_collect.enabled():
+                digit_collect.collect(kind or "hpmp", up, digits)
         except Exception:
-            return None, None
-        raw_text = self._extract_text(res)
-        digits = re.sub(r"[^0-9]", "", raw_text or "")
+            pass
         if not digits:
             return None, None
         cur = _split_cur_max(digits, int(max_val))

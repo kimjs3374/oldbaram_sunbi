@@ -24,7 +24,6 @@ from .skill_blueprints import (  # noqa: F401
     default_skills,
     _cd_empty,
     _buff_present,
-    _attacker_debuff_present,
 )
 
 

@@ -16,12 +16,12 @@ class CaptureCfg:
 @dataclass
 class VisionCfg:
     # ROOT 상대경로. dist 폴더 그대로 C:\oldbaram으로 옮겨도 동작.
-    weights: str = str(ROOT / "dataset" / "runs" / "full_v3" / "weights" / "best.pt")
-    imgsz: int = 640
+    weights: str = str(ROOT / "dataset" / "runs" / "full_v3_nano" / "weights" / "best.pt")
+    imgsz: int = 416
     conf: float = 0.25
     iou: float = 0.5
     half: bool = True
-    device: int = 0
+    device: int = -1   # -1 = ONNX CPU 강제 (게임 GPU 경합/spike 회피). GPU 안 씀.
 
 
 @dataclass
@@ -84,13 +84,6 @@ class CooldownCfg:
     buff_region_y: int = -1
     buff_region_w: int = 0
     buff_region_h: int = 0
-    # 2026-04-21: 채팅창 하단 "자리 바꿀 아이템[a-Z,a-Z ?]" 감지 영역.
-    # 보호/무장 Shift+Z+C/X 시전 후 이 영역에 글자 감지되면 자리 바꾸기
-    # 모드 진입으로 판정 → ESC 1회 자동 송신해 복구.
-    chat_region_x: int = -1
-    chat_region_y: int = -1
-    chat_region_w: int = 0
-    chat_region_h: int = 0
     # HP/MP 바 OCR 영역 (힐러/격수 공용 per-PC).
     # 격수 HP/MP 는 State.hp_pct/mp_pct 로 힐러에 전송 → 힐러 SkillScheduler
     # 가 격수부활 트리거에 사용. 힐러 자신 HP/MP 는 자힐/공력증강 트리거.

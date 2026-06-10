@@ -77,31 +77,49 @@ class YoloRunner:
         w = Path(weights)
         if not w.exists():
             raise FileNotFoundError(f"weights not found: {w}")
-        # cudnn.benchmark: 입력 크기 고정(imgsz=640)일 때 첫 몇 프레임 동안
-        # 최적 kernel 선택 후 캐시. CUDA 13.1 ↔ torch cu124 mismatch 환경에서
-        # fp16 JIT 반복을 줄이는 핵심 스위치. engine 로드 시에도 해롭지 않음
-        # (engine 은 TensorRT runtime 이라 cudnn 경로 미사용).
-        if torch is not None:
+        # 백엔드 자동 선택 (2026-06-09): CUDA 가용 → PyTorch+GPU.
+        # CUDA 없음(또는 device='cpu'/-1) → 형제 .onnx 를 ONNX Runtime CPU 로.
+        # GPU 없는 저사양 PC(i5-6600 등) 지원. ONNX CPU 는 PyTorch CPU 대비
+        # 9~10배 빠름 (실측 2026-06-09: yolov8s imgsz320 PyTorch 129ms→ONNX 13ms).
+        cuda_ok = bool(torch.cuda.is_available()) if torch is not None else False
+        want_cpu = (not cuda_ok) or (str(device).strip().lower() in ("cpu", "-1"))
+        chosen = w
+        self._backend = "pytorch"
+        if want_cpu:
+            if w.suffix.lower() == ".onnx":
+                chosen, self._backend = w, "onnx"
+            else:
+                onnx_sib = w.with_suffix(".onnx")
+                if onnx_sib.exists():
+                    chosen, self._backend = onnx_sib, "onnx"
+                else:
+                    # .onnx 동봉 안 됨 → PyTorch CPU 폴백 (느림). 경고로 노출.
+                    self._backend = "pytorch-cpu"
+        # cudnn.benchmark: CUDA(PyTorch GPU) 경로에서만 의미. 입력 크기 고정 시
+        # 최적 kernel 캐시 (fp16 JIT 반복 감소). CPU/ONNX 경로에선 무관.
+        # Patch 2.19: TensorRT engine 자동탐지 폐기 유지 (기계종속 스파이크).
+        if torch is not None and not want_cpu:
             try:
                 torch.backends.cudnn.benchmark = True
             except Exception:
                 pass
-        # Patch 2.19 (2026-04-20): TensorRT engine 자동 탐지 폐기.
-        # engine 파일이 GPU architecture / CUDA runtime 종속이라
-        # 기계가 바뀌거나 드라이버가 바뀌면 predict 200~840ms 스파이크
-        # 관측 (3080 기계 실증). PyTorch 백엔드로 고정.
-        self.model = YOLO(str(w))
-        self._backend = "pytorch"
+        self.model = YOLO(str(chosen))
         if log_fn is not None:
             try:
-                log_fn(f"[YOLO-INIT] backend=PyTorch weights={w}")
+                log_fn(f"[YOLO-INIT] backend={self._backend} weights={chosen.name} "
+                       f"cuda_ok={cuda_ok} want_cpu={want_cpu}")
             except Exception:
                 pass
         self.imgsz = imgsz
         self.conf = conf
         self.iou = iou
-        self.half = half
-        self.device = device
+        # CPU 경로: half(fp16) 무의미 → False, device 'cpu' 정규화.
+        if want_cpu:
+            self.half = False
+            self.device = "cpu"
+        else:
+            self.half = half
+            self.device = device
         # device 실제 적용 결과 확인. CUDA 미설치/드라이버 문제면 CPU 폴백 발생.
         # yolo 추론이 100ms+ 찍히는 주범 진단용 (2026-04-20).
         self._log_device(log_fn)
@@ -126,7 +144,8 @@ class YoloRunner:
             cuda_count = int(torch.cuda.device_count()) if torch else 0
             cuda_name = (
                 torch.cuda.get_device_name(self.device)
-                if (torch and cuda_avail and cuda_count > int(self.device))
+                if (torch and cuda_avail and isinstance(self.device, int)
+                    and cuda_count > self.device)
                 else "N/A"
             )
             log_fn(

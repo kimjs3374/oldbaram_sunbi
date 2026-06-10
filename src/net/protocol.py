@@ -35,18 +35,10 @@ class State:
     mp: int = -1
     map_seq: int = 0
     map_change_pending: bool = False
-    # 격수 버프 영역 OCR에서 관측된 "혼마술" 디버프 남은 초.
-    # -1 = OCR 영역 미지정/미관측. 양수 = 혼마술 걸림 → 힐러가 파혼술 시전.
-    debuff_honmasul_sec: int = -1
     # 격수 HP/MP 바율 (0~100 정수 %). -1 = OCR 영역 미지정/미관측.
     # 힐러 SkillScheduler 가 격수부활(hp_pct==0) 트리거로 사용.
     hp_pct: int = -1
     mp_pct: int = -1
-    # 2026-04-21: 격수 버프 "무장"/"보호" 남은 초.
-    # -1 = OCR 영역 미지정/미관측. >0 = 버프 지속 중. 0 이하 = 버프 없음
-    # → 힐러가 Shift+Z → Shift+C (무장) 또는 Shift+X (보호) 시전.
-    buff_mujang_sec: int = -1
-    buff_boho_sec: int = -1
 
     def to_bytes(self) -> bytes:
         d = asdict(self)

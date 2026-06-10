@@ -46,23 +46,21 @@ class HealerWorker(QtCore.QThread):
         # 따라가기 전용 모드 (2026-04-17 추가): True면 스킬 완전 OFF,
         # 이동/TAB-CONFIRM만. 격수 뒤만 졸졸 따라다니는 용도.
         self.follow_only = False
+        # 2026-06-07 따라가기 경량 모드 (저사양 대응). True 면 빨탭 YOLO +
+        # cooldown/buff/hp/mp OCR 정지. 유지: coord/맵 OCR(이동) + 경험치 OCR
+        # + 격수 좌표 UDP 추종. main_window 체크박스로 런타임 토글.
+        self.follow_light = False
         # v6-edge: HpMpReader 값 갱신 시 edge 감지용 상태.
         # False→True 전환(상태 cross-down) 순간에만 request_cast. 상태 유지 중
         # 에는 재시전 안 함. 사용자 원 설계 "OCR 받자마자 1회 즉시 시전".
         self._self_dead_prev = False
-        self._hp_below_thr_prev = False
         self._mp_below_thr_prev = False
         # 2026-04-22: _mp_imminent_prev 제거 — "공력증강 임박" 힐러측 알림은
         # 격수 로컬 판정(_check_gyoungryeok_imminent) 과 중복이라 폐기.
         # 힐러 → 격수 알림 이벤트 seq (격수가 새 이벤트 판정용).
         self._alert_seq = 0
-        # attacker UDP State 기반 edge (격수부활 / 파혼술 / 무장 / 보호).
+        # attacker UDP State 기반 edge (격수부활).
         self._attacker_dead_prev = False
-        self._attacker_honma_prev = False
-        # 무장/보호 버프 존재 여부 추적. 초기값 True (보유 중) 로 두고 첫 OCR
-        # 에서 없으면(-1/0) have→False edge 로 1회 시전. 이후 만료마다 edge.
-        self._attacker_mujang_have_prev = True
-        self._attacker_boho_have_prev = True
         # 이동 lock stuck 감시: movement_lock=True 가 10초 이상 지속되면
         # 강제 해제. scheduler 예외/데드락 방어. 따라가기 기능 절대 보장.
         self._movement_lock_since: float = 0.0
@@ -78,6 +76,11 @@ class HealerWorker(QtCore.QThread):
         # 시 원복. buff OCR 에서 "파력무참" >0 관측이 active 판정 기준.
         self._parlyuk_buff_active: bool = False
         self._coord_tol_saved: Optional[int] = None
+        # 2026-06-10 사용자 요청: 파력무참 시전 허용 굴 집합 (맵명 끝 (N) 의 N).
+        # 빈 집합 = 전체 굴 허용(기존 동작). set_parlyuk_maps 로 UI 반영.
+        self._parlyuk_maps: set = set()
+        # 공력증강 hysteresis 상태 (2026-06-10): MP<임계 시작 → 90% 도달까지 시전.
+        self._gyoung_active: bool = False
         self.yolo_every_n = 1
         # --- 저사양 모드 런타임 튠 (main_window._on_toggle_low_spec이 setattr). ---
         # 0/기본값이면 효과 없음. YoloRunner.imgsz는 런타임 값 치환 가능.
@@ -103,15 +106,11 @@ class HealerWorker(QtCore.QThread):
         self.healer_coord = None
         self.healer_map = ""
         # 스킬 토글/오프셋: GUI에서 start 전에 주입, 이후엔 런타임 반영.
-        # 2026-04-20: 공력증강 조건부 전환, 부활/파혼술 신규 추가.
+        # 2026-04-20: 공력증강 조건부 전환, 부활 신규 추가.
         self.skill_enabled: dict = {
             "백호의희원": True, "백호의희원첨": True,
-            "공력증강": True, "부활": True, "파혼술": True,
+            "공력증강": True, "부활": True,
             "파력무참": True, "금강불체": False,
-            # 2026-04-21 격수 버프 재시전.
-            "무장": True, "보호": True,
-            # 2026-04-22 자힐 단독 ON/OFF (자가부활은 "부활" 토글로 별도 제어).
-            "자힐": True,
         }
         self.parlyuk_offset: float = 0.0
         self._skills = None  # SkillScheduler가 사용하는 SkillSpec 리스트 참조.
@@ -128,13 +127,17 @@ class HealerWorker(QtCore.QThread):
             "백호의희원": 0x64, "백호의희원첨": 0x65,
             "공력증강": 0x63,
             "부활": 0x66,
-            "파혼술": 0x67,
             "파력무참": 0x68,
             "금강불체": 0x60,
         }
         self._cycler = None  # NumLockCycler 참조 (런타임 슬롯 변경용).
         self._last_state = None  # FSM 상태 전이 감지용.
         self._last_map_neq = False  # 맵 불일치 False→True 전이 시 Tab press.
+        # 2026-06-10 정지 latch: tol 충족(at_target) 후 격수가 tol 초과 이동
+        # 전까지 정지 유지. 격수 방향만 바뀌거나 OCR 미세흔들림에 안 따라가
+        # "계속 돌아다니는" 현상 차단 (사용자 요청).
+        self._follow_parked = False
+        self._park_atk: Optional[tuple] = None
         self._last_f1_pending = False  # 격수 F1 예고 플래그 엣지 감지용.
         self._last_hold_ts = 0.0    # 강제 재hold 스로틀 (같은 방향 장기 고정 시 재발송).
         self._need_rehold = False   # 스킬 시전 직후 메인 루프에 재hold 요청.
@@ -268,21 +271,6 @@ class HealerWorker(QtCore.QThread):
                 cfg.cooldown.buff_region_x, cfg.cooldown.buff_region_y,
                 cfg.cooldown.buff_region_w, cfg.cooldown.buff_region_h,
             )
-        # 2026-04-21: 채팅 하단 OCR — 보호/무장 cast 후 "자리 바꿀 아이템"
-        # 팝업 감지용. 글자 있으면 ESC 자동 송신해 복구.
-        self._chat_ocr = CooldownOcr(poll_sec=0.3)  # 팝업 감지용 빠른 주기
-        try:
-            # target 더미 1개 — CooldownOcr 는 target 있어야 파싱. raw_text
-            # 는 target 무관하게 반환되므로 무엇이든 OK.
-            self._chat_ocr.set_target_skills(["자리"])
-        except Exception:
-            pass
-        if (getattr(cfg.cooldown, "chat_region_x", -1) >= 0
-                and getattr(cfg.cooldown, "chat_region_w", 0) > 0):
-            self._chat_ocr.set_region(
-                cfg.cooldown.chat_region_x, cfg.cooldown.chat_region_y,
-                cfg.cooldown.chat_region_w, cfg.cooldown.chat_region_h,
-            )
         # 스킬 내부 datetime 타이머 (OCR은 오차검증용).
         self._timer_parlyuk = SkillCdTimer("parlyuk", self.log)
         self._timer_baekho = SkillCdTimer("baekho", self.log)
@@ -397,21 +385,6 @@ class HealerWorker(QtCore.QThread):
         try:
             self._buff_ocr.clear_region()
             self.log.info("[BUFF] region 해제")
-        except Exception:
-            pass
-
-    def set_chat_region(self, x: int, y: int, w: int, h: int) -> None:
-        """채팅 하단 자리바꾸기 팝업 감지 영역."""
-        try:
-            self._chat_ocr.set_region(int(x), int(y), int(w), int(h))
-            self.log.info(f"[CHAT] region 설정 x={x} y={y} w={w} h={h}")
-        except Exception as e:
-            self.log.warning(f"[CHAT] region 설정 실패: {e}")
-
-    def clear_chat_region(self) -> None:
-        try:
-            self._chat_ocr.clear_region()
-            self.log.info("[CHAT] region 해제")
         except Exception:
             pass
 
@@ -812,7 +785,6 @@ class HealerWorker(QtCore.QThread):
             def _ctx():
                 # v4: SkillScheduler._verify 가 ctx["buffs"] / ctx["cooldowns"]
                 # 를 참조. 1Hz OCR 최신 결과 주입.
-                # + attacker_buffs: 격수 State.debuff_honmasul_sec 를 노출.
                 # + self_hp_pct / self_mp_pct: 힐러 HpMpReader.latest().
                 # + attacker_hp_pct / attacker_mp_pct: 격수 State.hp_pct/mp_pct.
                 ctx = {}
@@ -831,17 +803,6 @@ class HealerWorker(QtCore.QThread):
                     atk = recv.latest()
                 except Exception:
                     atk = None
-                try:
-                    hon = int(getattr(atk, "debuff_honmasul_sec", -1)) if atk else -1
-                    muj = int(getattr(atk, "buff_mujang_sec", -1)) if atk else -1
-                    boh = int(getattr(atk, "buff_boho_sec", -1)) if atk else -1
-                    ctx["attacker_buffs"] = {
-                        "혼마술": hon,
-                        "무장": muj,
-                        "보호": boh,
-                    }
-                except Exception:
-                    ctx["attacker_buffs"] = {}
                 # 힐러 자신 HP/MP (픽셀 비율, 매 프레임 메인 루프가 갱신).
                 try:
                     hm = _worker_self._hpmp.latest()
@@ -865,6 +826,8 @@ class HealerWorker(QtCore.QThread):
                 except Exception:
                     ctx["attacker_hp_pct"] = -1
                     ctx["attacker_mp_pct"] = -1
+                # 파력무참 시전 굴 판정용 현재 힐러 맵.
+                ctx["map_name"] = getattr(_worker_self, "healer_map", "") or ""
                 return ctx
     
             # 블록A/B 훅 — 자힐/자가부활 pre/post.
@@ -1038,85 +1001,6 @@ class HealerWorker(QtCore.QThread):
             # 임계치는 callable 로 전달 → predicate 매 tick 마다 최신 워커 값 조회.
             # (UI 스피너 변경 시 self.self_heal_hp_thr / gyoungryeok_mp_thr 즉시 반영.)
             _worker_for_thr = self
-            # 무장/보호 시전 훅 — Shift+Z → Shift+C/X 시퀀스.
-            # cycler 전달해서 cast 중 Shift 와 NumPad scan 충돌 방지 (봉황의
-            # 기원 토글 꼬임 수정).
-            from ..input.target_sequence import cast_mujang, cast_boho
-            # 채팅 팝업 감지 후 ESC 자동 송신. cast_shift_z_then 이후 호출.
-            # 게임이 자리바꾸기 모드 ("자리 바꿀 아이템[a-Z,a-Z]") 진입 시 ESC 1회.
-            import ctypes as _ct
-            _u32 = _ct.WinDLL("user32", use_last_error=True)
-            def _check_chat_and_esc(label: str) -> None:
-                # 2026-04-21: cast 시점 1회만 OCR. main loop 상주 제거 → GPU
-                # 부담 ↓. last_frame 을 chat_ocr 에 명시 submit 후 대기.
-                try:
-                    if not _worker_self._chat_ocr.ready():
-                        return  # 채팅 영역 미지정.
-                    fr = getattr(_worker_self, "_last_frame", None)
-                    orig = getattr(
-                        _worker_self, "_last_frame_origin", (0, 0)
-                    )
-                    if fr is None:
-                        return
-                    # 기존 캐시 무효화용으로 submit (새 ts 로 OCR 수행).
-                    _worker_self._chat_ocr.submit_frame(fr, orig)
-                    # OCR 백그라운드 스레드가 poll_sec 안에 1회 실행.
-                    # poll_sec=0.3 이므로 최대 0.6초면 결과 나옴.
-                    t_end = time.time() + 0.8
-                    prev_ts = float(getattr(
-                        _worker_self._chat_ocr.latest(), "ts", 0
-                    ) or 0)
-                    while time.time() < t_end:
-                        time.sleep(0.05)
-                        r = _worker_self._chat_ocr.latest()
-                        cur_ts = float(getattr(r, "ts", 0) or 0)
-                        if cur_ts > prev_ts:
-                            break
-                    r = _worker_self._chat_ocr.latest()
-                    raw = str(getattr(r, "raw_text", "") or "").strip()
-                    if raw:
-                        # 화면에 글자 있음 = 자리바꾸기 모드 (또는 다른 팝업).
-                        _u32.keybd_event(0x1B, 0x01, 0, 0)   # ESC down
-                        time.sleep(0.03)
-                        _u32.keybd_event(0x1B, 0x01, 2, 0)   # ESC up (KEYUP=2)
-                        _worker_self.log.info(
-                            f"[CHAT-ESC] {label} 후 팝업 감지 "
-                            f"raw={raw[:50]!r} → ESC 송신"
-                        )
-                except Exception as _e:
-                    _worker_self.log.warning(f"[CHAT-ESC] 체크 실패: {_e}")
-
-            def _hook_cast_mujang(_c):
-                try:
-                    cast_mujang(log_fn=_log_i, cycler=_cycler_ref)
-                    # cast 직후 채팅 체크. 내부에서 OCR submit + 결과 대기.
-                    _check_chat_and_esc("무장")
-                except Exception as e:
-                    self.log.warning(f"[MUJANG] 시전 실패: {e}")
-            def _hook_cast_boho(_c):
-                try:
-                    cast_boho(log_fn=_log_i, cycler=_cycler_ref)
-                    _check_chat_and_esc("보호")
-                except Exception as e:
-                    self.log.warning(f"[BOHO] 시전 실패: {e}")
-
-            # 파혼술 hook — NumPad scan 직접 송신 (nvk 변환 안 함).
-            # 이전엔 press_normal_vk(0x67)→nvk=0x37(main 7)로 송신돼서 게임이
-            # 안 먹던 버그. NumPad7 단축키 매핑된 경우 scan 0x48 로 press.
-            from ..input.numlock_cycle import press_numpad_direct
-            def _hook_cast_parhon(_c):
-                try:
-                    vk = int(_worker_self.skill_vks.get("파혼술", 0x67))
-                    t_end = time.time() + 0.5  # burst 0.5s
-                    n = 0
-                    while time.time() < t_end:
-                        press_numpad_direct(vk)
-                        n += 1
-                        time.sleep(0.1)
-                    _log_i(f"[PARHON] NumPad scan burst x{n} vk={hex(vk)}")
-                except Exception as e:
-                    self.log.warning(f"[PARHON] 시전 실패: {e}")
-
             skills = default_skills(
                 parlyuk_offset_sec=self.parlyuk_offset,
                 vk_map=dict(self.skill_vks),
@@ -1126,9 +1010,10 @@ class HealerWorker(QtCore.QThread):
                 post_block_b=_hook_block_b,
                 post_self_resurrect=_hook_self_resurrect_post,
                 pre_block_ab=_hook_block_ab,
-                cast_mujang_hook=_hook_cast_mujang,
-                cast_boho_hook=_hook_cast_boho,
-                cast_parhon_hook=_hook_cast_parhon,
+                parlyuk_maps_getter=lambda: set(_worker_for_thr._parlyuk_maps),
+                gyoung_active_getter=lambda: _worker_for_thr._gyoung_active,
+                gyoung_active_setter=lambda v: setattr(
+                    _worker_for_thr, "_gyoung_active", bool(v)),
             )
             # 초기 enabled 반영 (UI 토글과 일치).
             # "부활" 토글 하나가 자가부활/격수부활 둘 다 제어.
@@ -1203,28 +1088,8 @@ class HealerWorker(QtCore.QThread):
                         _worker_self._self_dead_prev = dead_now
                 else:
                     _worker_self._self_dead_prev = dead_now
-                # 자힐 edge: HP<thr 로 처음 cross down 할 때만. (맵 전환 중엔 보류)
-                try:
-                    thr_hp = int(_worker_self.self_heal_hp_thr)
-                except Exception:
-                    thr_hp = 50
-                hp_below_now = (0 <= hp < thr_hp) and not dead_now
-                if hp_below_now and not _worker_self._hp_below_thr_prev:
-                    if _map_transition_in_progress:
-                        _worker_self.log.warning(
-                            f"[EDGE-DEFER] 자힐 요청 보류 HP={hp}<{thr_hp} "
-                            f"(맵 전환 중 h_map={_worker_self.healer_map!r} "
-                            f"a_map={atk.map_name!r})"
-                        )
-                        # prev 갱신 안 함 → 맵 동기화 후 재평가.
-                    else:
-                        sched.request_cast("자힐")
-                        _worker_self.log.info(
-                            f"[EDGE] HP {hp}<{thr_hp} → 자힐 요청"
-                        )
-                        _worker_self._hp_below_thr_prev = hp_below_now
-                else:
-                    _worker_self._hp_below_thr_prev = hp_below_now
+                # 자힐 edge — 2026-06-07 자힐 스킬 완전 제거. HP 가 낮아도
+                # self-target/자힐 요청을 보내지 않음. (자가부활 edge 는 유지.)
                 # 공력증강 edge: MP<thr 로 처음 cross down 할 때만.
                 try:
                     thr_mp = int(_worker_self.gyoungryeok_mp_thr)
@@ -1286,11 +1151,6 @@ class HealerWorker(QtCore.QThread):
                 self._buff_ocr.start()
             except Exception as _e:
                 self.log.warning(f"[BUFF] thread start 실패: {_e}")
-            try:
-                _time.sleep(0.25)
-                self._chat_ocr.start()
-            except Exception as _e:
-                self.log.warning(f"[CHAT] thread start 실패: {_e}")
             self.log.info(
                 f"[COOLDOWN] healer_idx={int(getattr(cfg.net,'healer_idx',0))} "
                 f"atk_recv_port={int(getattr(cfg.net,'attacker_recv_port',45455))} "
@@ -1375,7 +1235,7 @@ class HealerWorker(QtCore.QThread):
                 except Exception:
                     pass
     
-                if frame_idx % yn == 0:
+                if frame_idx % yn == 0 and not self.follow_light:
                     t1 = time.perf_counter()
                     # 백그라운드 YOLO 에 최신 frame 제출 (비블로킹, 즉시 리턴).
                     if crop_frame is not None:
@@ -1537,7 +1397,7 @@ class HealerWorker(QtCore.QThread):
                         self._movement_lock_since = 0.0
                 except Exception:
                     pass
-                # v6-edge: attacker UDP State 기반 edge 감지 → 격수부활 / 파혼술.
+                # v6-edge: attacker UDP State 기반 edge 감지 → 격수부활.
                 try:
                     atk_hp = int(getattr(atk, "hp_pct", -1))
                     # 격수부활: attacker HP==0 cross-down + 힐러 살아있을 때.
@@ -1549,30 +1409,6 @@ class HealerWorker(QtCore.QThread):
                             f"[EDGE] atk_hp==0 & self_hp={self_hp_now}>0 → 격수부활 요청"
                         )
                     self._attacker_dead_prev = atk_dead_now
-                    # 파혼술: 격수 혼마술 버프가 걸리는 순간.
-                    honma = int(getattr(atk, "debuff_honmasul_sec", -1))
-                    honma_now = honma > 0
-                    if honma_now and not self._attacker_honma_prev:
-                        self._sched.request_cast("파혼술")
-                        self.log.info(f"[EDGE] atk 혼마술={honma}s → 파혼술 요청")
-                    self._attacker_honma_prev = honma_now
-                    # 무장 edge: 확정 0 (OCR 돌았고 글자 없음) 일 때만 시전 요청.
-                    # -1 (OCR 미수행) 상태는 "모름" → 시전 요청 안 함 (안전).
-                    muj = int(getattr(atk, "buff_mujang_sec", -1))
-                    mujang_have_now = (muj >= 1)  # 1=있음
-                    if muj == 0 and self._attacker_mujang_have_prev:
-                        self._sched.request_cast("무장")
-                        self.log.info("[EDGE] atk 무장 버프 없음 → 무장 요청")
-                    if muj != -1:  # -1 은 prev 갱신 보류.
-                        self._attacker_mujang_have_prev = mujang_have_now
-                    # 보호 edge 동일.
-                    boh = int(getattr(atk, "buff_boho_sec", -1))
-                    boho_have_now = (boh >= 1)
-                    if boh == 0 and self._attacker_boho_have_prev:
-                        self._sched.request_cast("보호")
-                        self.log.info("[EDGE] atk 보호 버프 없음 → 보호 요청")
-                    if boh != -1:
-                        self._attacker_boho_have_prev = boho_have_now
                 except Exception:
                     pass
                 # 2026-04-22 사용자 요청: 파력무참 버프 지속 중 coord_tol=1 강제,
@@ -1798,7 +1634,11 @@ class HealerWorker(QtCore.QThread):
                 # 양쪽 맵이 확정(len>=2)되고 다르면 True.
                 h_ok = bool(self.healer_map) and len(self.healer_map) >= 2
                 a_ok = bool(atk.map_name) and len(atk.map_name) >= 2
-                map_neq = h_ok and a_ok and self.healer_map != atk.map_name
+                # 격수 좌표급변(=맵전환)→map_change_pending 즉시 ON (맵OCR 지연 무관,
+                # map_seq/좌표 기반 0.01초). 사냥중 흰탭/trail reject 근본해결:
+                # map_name(느린 OCR) 대신 격수 좌표신호를 신뢰.
+                map_neq = ((h_ok and a_ok and self.healer_map != atk.map_name)
+                           or bool(getattr(atk, "map_change_pending", False)))
     
                 # 격수 F1 예고 플래그 엣지 로그.
                 f1_pending = bool(getattr(atk, "map_change_pending", False))
@@ -2050,14 +1890,28 @@ class HealerWorker(QtCore.QThread):
                         # FSM은 DEAD/DISCONNECTED만 제외.
                         arm_ok_fsm = state not in (FsmState.DEAD,
                                                     FsmState.DISCONNECTED)
+                        # 2026-06-10 속도: 격수 맵전환 확정 신호(map_neq 또는
+                        # map_change_pending) 동반 흰탭이면 오탐 아님 → confirm
+                        # 1프레임 즉시 arm. 사람의 "격수 사라짐 보고 즉시 Tab"
+                        # 재현 (3프레임 대기 ~0.15s 제거). 신호 없으면 기존 3.
+                        _arm_need = 3
+                        if map_neq or bool(getattr(
+                                atk, "map_change_pending", False)):
+                            _arm_need = 1
                         # 따라가기 전용: TAB-CONFIRM 자체 차단. Tab 송신 금지.
                         # 빨탭 없이 coord-follow + exit_dir 만으로 맵 이동 수행.
-                        if (self._whitetab_confirm >= 3
+                        # 수정A (2026-06-11): 본인 빨탭 후 맵전환 grace 중엔
+                        # arm 억제 (5-1 본인빨탭 루프 차단). grace 끝나도 흰탭
+                        # 지속이면 그때 정상 arm.
+                        _grace = (hasattr(fol, "post_tab_grace_active")
+                                  and fol.post_tab_grace_active(now_sec))
+                        if (self._whitetab_confirm >= _arm_need
                                 and not red_raw
                                 and not fol._tab_confirm_active
                                 and atk.coord_valid
                                 and arm_ok_fsm
-                                and not self.follow_only):
+                                and not self.follow_only
+                                and not _grace):
                             self.log.info(
                                 f"[WHITETAB-ARM] confirm="
                                 f"{self._whitetab_confirm} route=A "
@@ -2305,37 +2159,32 @@ class HealerWorker(QtCore.QThread):
                         origin = (int(_mon.get("left", 0)),
                                   int(_mon.get("top", 0)))
                         # 메인 루프는 참조만 전달 → 백그라운드 스레드가 copy().
-                        self._cooldown_ocr.submit_frame(frame, origin)
+                        # 따라가기 경량: cooldown OCR predict 정지 (submit skip).
+                        if not self.follow_light:
+                            self._cooldown_ocr.submit_frame(frame, origin)
                         cd_read = self._cooldown_ocr.latest()
                         self._last_cooldown = cd_read
-                        # 내부 타이머 anchor/검증.
-                        self._timer_parlyuk.on_ocr(int(cd_read.cd_parlyuk))
-                        self._timer_baekho.on_ocr(int(cd_read.cd_baekho))
-                        # XP OCR 동일 frame 제출 (region 지정 시에만 동작).
+                        if not self.follow_light:
+                            # 내부 타이머 anchor/검증.
+                            self._timer_parlyuk.on_ocr(int(cd_read.cd_parlyuk))
+                            self._timer_baekho.on_ocr(int(cd_read.cd_baekho))
+                        # XP OCR 동일 frame 제출 — 경험치는 따라가기에도 유지.
                         if self._xp_ocr is not None and self._xp_ocr.ready():
                             self._xp_ocr.submit_frame(frame, origin)
                         # 버프 OCR 동일 frame 제출 (region 지정 시에만 동작).
-                        try:
-                            if self._buff_ocr.ready():
-                                self._buff_ocr.submit_frame(frame, origin)
-                        except Exception:
-                            pass
-                        # 2026-04-21: 채팅 OCR 은 매 tick 이 아닌 보호/무장 cast
-                        # 직후에만 명시 submit. main loop 상주 시 PaddleOCR 스레드
-                        # 가 GPU 자원 점유해 YOLO FPS 급락 (2.7→1.8).
-                        # 대신 last_frame 저장 → cast hook 이 활용.
-                        try:
-                            self._last_frame = frame
-                            self._last_frame_origin = origin
-                        except Exception:
-                            pass
-                        # HP/MP 픽셀 리더 즉시 수행 (OCR 아님, 가벼움).
-                        # 매 OCR tick(1Hz)마다 갱신되면 충분 — 스킬 스케줄러는
-                        # 500ms poll 이므로.
-                        try:
-                            self._hpmp.read(frame, origin)
-                        except Exception:
-                            pass
+                        # 따라가기 경량: 정지.
+                        if not self.follow_light:
+                            try:
+                                if self._buff_ocr.ready():
+                                    self._buff_ocr.submit_frame(frame, origin)
+                            except Exception:
+                                pass
+                        # HP/MP 픽셀 리더 — 따라가기 경량: 정지 (자힐/공증 미사용).
+                        if not self.follow_light:
+                            try:
+                                self._hpmp.read(frame, origin)
+                            except Exception:
+                                pass
                         # 1Hz OCR 결과 진단 로그 (ts 변화 = 새 OCR 수행).
                         if (cd_read.ts > 0
                                 and cd_read.ts > self._cd_last_log_ts):
@@ -2577,10 +2426,6 @@ class HealerWorker(QtCore.QThread):
             except Exception:
                 pass
             try:
-                self._chat_ocr.stop()
-            except Exception:
-                pass
-            try:
                 if self._xp_ocr is not None:
                     self._xp_ocr.stop()
             except Exception:
@@ -2622,15 +2467,14 @@ class HealerWorker(QtCore.QThread):
     def set_skill_vk(self, name: str, vk: int):
         """조건부 스킬 VK 변경.
 
-        2026-04-20: "메인힐" → "자힐" SkillSpec 에도 vk 전파 (자힐 burst 재사용).
         "부활" → "자가부활"/"격수부활" 둘 다 전파 (공용 VK).
+        (2026-06-07 자힐 스킬 제거로 "메인힐"→"자힐" 전파 삭제.)
         """
         self.skill_vks[name] = vk
         if self._skills is None:
             return
         # 공용 VK 매핑: 이름 → 실제 SkillSpec 이름들.
         _alias = {
-            "메인힐": ("자힐",),
             "부활": ("자가부활", "격수부활"),
         }
         target_names = _alias.get(name, (name,))
@@ -2647,10 +2491,24 @@ class HealerWorker(QtCore.QThread):
             if s.name == "파력무참":
                 s.offset_sec = sec
 
+    def set_parlyuk_maps(self, text) -> None:
+        """파력무참 시전 굴 설정 (2026-06-10). '3,5' → {3,5}.
+
+        빈 문자열/None → set() (전체 굴 허용, 기존 동작). 맵명 끝 '(N)' 의 N 과
+        대조해 시전 게이트. predicate(_parlyuk_map_ok)가 매 tick 최신값 조회.
+        """
+        s = set()
+        for tok in str(text or "").replace(" ", "").split(","):
+            if tok.isdigit():
+                s.add(int(tok))
+        self._parlyuk_maps = s
+        self.log.info(f"[PARLYUK-MAPS] 시전 굴 설정 → {sorted(s) or '전체'}")
+
     def _decide_move(self, atk, fol, map_neq: bool) -> tuple:
         """B안 래퍼: 원 decision 결과에 STUCK 감지/언스턱 오버라이드 적용."""
         want, reason = self._decide_move_raw(atk, fol, map_neq)
         return self._apply_stuck_filter(want, reason, atk, fol, map_neq)
+
 
     def _blacklist_add(self, map_name: str, coord, direction: str) -> None:
         """STUCK-RESET 발생 시 호출. v5.1: 첫 발생은 용서(도사끼리 막힘 대응).
@@ -2842,14 +2700,47 @@ class HealerWorker(QtCore.QThread):
         # 전역 trail 태그 전이(격수 맵 전환 확정) 직후 N초 — exit_dir 강제 홀드.
         # 맵 이름 OCR 지연 케이스에도 격수가 새 맵 태그로 한 프레임이라도
         # 좌표 송신하면 즉시 발동 → 힐러 이동 강제.
+        # 2026-06-10 (수정 B): map_neq=False(격수와 같은 맵 도달)면 FORCE-EXIT
+        # 즉시 해제. 안 하면 잔여 시간 동안 도사가 격수를 지나쳐 다음 포탈로 또
+        # 넘어감(혼자 포탈 #3, 뒤로 복귀 #4). 같은 맵이면 격수 좌표만 추종.
         if hasattr(fol, "force_exit_active") and fol.force_exit_active():
-            exit_d = fol.exit_dir()
-            if exit_d in ("L", "R", "U", "D"):
-                remain = fol.force_exit_remaining()
-                return exit_d, (
-                    f"FORCE-EXIT exit_dir={exit_d!r} "
-                    f"remain={remain:.2f}s (global trail map transition)"
+            if not map_neq:
+                if hasattr(fol, "cancel_force_exit"):
+                    fol.cancel_force_exit()
+                self.log.info(
+                    "[FORCE-EXIT-CANCEL] 격수와 같은 맵 도달 → 해제, 격수 추종"
                 )
+            elif fol._tab_confirm_active:
+                # 2026-06-11 사용자 우선요구: 본인 빨탭 고정(TAB-CONFIRM done)
+                # 전엔 포탈 통과 보류. 빨탭 미확정 채 넘어가면 새맵서 본인 힐 →
+                # 손으로 넘겨주는 시간 로스가 더 큼. 빨탭 확정 후 exit.
+                return "-", "EXIT-HOLD: 본인빨탭 고정 대기(TAB-CONFIRM 중)"
+            else:
+                # 2026-06-11 근본수정: 포탈 좌표(_exit_coord) 직행 우선.
+                # 기존 exit_dir 방향키만으론 한 축만 밀어 x(또는 y) 안 맞으면
+                # 벽에 막혀 멍때림 (healer-120 follow_only 41s: 포탈 (7,0)인데
+                # exit_dir U로 위만 밀다 (9,2)(11,2) blocked=U 벽). 좌표로 가면
+                # x·y 둘 다 맞춰 직행. STUCK 필터가 벽 우회까지 처리.
+                ec = getattr(fol, "_exit_coord", None)
+                if ec is not None and h is not None:
+                    ex, ey = ec
+                    if abs(ex - h[0]) + abs(ey - h[1]) > tol:
+                        dx, dy = ex - h[0], ey - h[1]
+                        w = (("R" if dx > 0 else "L")
+                             if abs(dx) >= abs(dy)
+                             else ("D" if dy > 0 else "U"))
+                        remain = fol.force_exit_remaining()
+                        return w, (
+                            f"FORCE-EXIT-PORTAL coord={ec} h={h} "
+                            f"remain={remain:.2f}s"
+                        )
+                exit_d = fol.exit_dir()
+                if exit_d in ("L", "R", "U", "D"):
+                    remain = fol.force_exit_remaining()
+                    return exit_d, (
+                        f"FORCE-EXIT exit_dir={exit_d!r} "
+                        f"remain={remain:.2f}s (global trail map transition)"
+                    )
 
         # F1 수동 예고: 격수가 포털 통과 임박 신호 송신 중.
         # map_neq=False인데 힐러-격수 좌표가 한 맵 범위를 초과하면 스테일 좌표 오발사 위험
@@ -2867,6 +2758,8 @@ class HealerWorker(QtCore.QThread):
         # 정책(피드백 feedback_route_trail.md): 격수 경로 전체를 순서대로 밟고,
         # 트레일 끝점 도달하면 exit_dir로 밀어 맵 전환 유도.
         if map_neq:
+            # 격수 맵 전환 → 정지 latch 해제 (수정 2: 새 맵에선 추종 재개).
+            self._follow_parked = False
             # 2026-04-22 trail_tol=1 (각 wp ±1 도달 허용).
             # 2026-04-23 exit_dash=True (map_neq 중): 격수 전투 zigzag trail을
             # 스킵하고 exit에 가장 가까운 직선 도달 가능 wp로 직행 → 포탈 통과
@@ -2916,6 +2809,11 @@ class HealerWorker(QtCore.QThread):
                 w = ed if ed in ("L", "R", "U", "D") else "-"
                 return w, f"B1b:TRAIL h=None exit_dir={ed!r}"
             # 트레일 끝점 도달했거나 트레일 없음 — exit_dir로 맵 전환 유도.
+            # 2026-06-11 사용자 우선요구: 본인 빨탭 고정(TAB-CONFIRM done) 전엔
+            # 포탈 통과(exit_dir 밀기) 보류. 빨탭 미확정 채 넘어가 본인 힐하면
+            # 손으로 넘겨주는 시간 로스가 더 큼. 빨탭 확정 후 넘어가기 우선.
+            if fol._tab_confirm_active:
+                return "-", "EXIT-HOLD: trail_end 본인빨탭 고정 대기"
             # G안: exit_dir='-'일 때 폴백 단계 추가 — 멈춤(trail_end 정지) 방지.
             #   1) fol.exit_dir() — 이전 맵 이탈 방향
             #   2) fol.direction() — 격수 최근 이동 방향
@@ -3029,6 +2927,17 @@ class HealerWorker(QtCore.QThread):
             hx, hy = h
             ax, ay = atk.x, atk.y
             ald = getattr(atk, "last_dir", "-")
+            # 정지 latch (수정 2): tol 충족(at_target) 후 park. 격수가 tol 초과
+            # 이동 전까지 정지 유지 → 격수 방향변화/OCR 미세흔들림에 안 따라가
+            # "계속 돌아다님" 차단. 격수가 실제 tol 넘게 움직이면 추종 재개.
+            if self._follow_parked and self._park_atk is not None:
+                if (abs(ax - self._park_atk[0])
+                        + abs(ay - self._park_atk[1])) <= tol:
+                    return "-", (
+                        f"B3-PARK 격수정지 대기 a=({ax},{ay}) "
+                        f"park={self._park_atk} tol={tol}"
+                    )
+                self._follow_parked = False
             FOLLOW_OFFSET = 1  # 격수 뒤 1칸 유지 (tol=1 밀착 추종 정책과 호환)
             if ald == "R":
                 tx, ty = ax - FOLLOW_OFFSET, ay
@@ -3043,9 +2952,12 @@ class HealerWorker(QtCore.QThread):
                 tx, ty = ax, ay
             tdx, tdy = tx - hx, ty - hy
             if abs(tdx) <= tol and abs(tdy) <= tol:
+                # 정지 latch ON: 격수 현재 좌표 기준 park (수정 2).
+                self._follow_parked = True
+                self._park_atk = (ax, ay)
                 return "-", (
                     f"B3a:at_target d_t=({tdx},{tdy}) h={h} "
-                    f"t=({tx},{ty}) a=({ax},{ay}) atk_dir={ald}"
+                    f"t=({tx},{ty}) a=({ax},{ay}) atk_dir={ald} PARK"
                 )
             # 주축/부축 후보 산출.
             x_dir = "R" if tdx > 0 else ("L" if tdx < 0 else None)

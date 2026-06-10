@@ -68,6 +68,9 @@ class TabConfirm:
         self.pre_stability_since: float = 0.0
         self.pre_stability_h_coord: Optional[tuple] = None
         self.post_confirm_pause_until: float = 0.0
+        # 2026-06-11: Tab(본인 빨탭) 송신 여부. MAP-SEQ-EDGE 취소 시 "이미 본인
+        # 빨탭 찍었나" 판정용 → 찍었으면 맵전환=전이시도로 보고 grace(재arm 억제).
+        self.tab_sent: bool = False
 
     # ----- 외부 API --------------------------------------------------
 
@@ -87,6 +90,7 @@ class TabConfirm:
         self.pre_stability_since = 0.0
         self.pre_stability_h_coord = None
         self.post_confirm_pause_until = 0.0
+        self.tab_sent = False
 
     def tick(
         self,
@@ -157,6 +161,7 @@ class TabConfirm:
             self.pending_key = ''
             self.last_key_ts = now
             self.counter = 0
+            self.tab_sent = True  # 본인 빨탭 송신 — 전이 시도 마킹 (2026-06-11)
             return 'send_tab'
 
         # A_wait_red (#3): red&!white N프레임 연속.
@@ -199,6 +204,7 @@ class TabConfirm:
         self.pre_stability_since = 0.0
         self.pre_stability_h_coord = None
         self.post_confirm_pause_until = 0.0
+        self.tab_sent = False
         return old_sub
 
     def is_pausing(self, now: float) -> bool:

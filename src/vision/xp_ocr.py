@@ -43,6 +43,16 @@ class XpOcr:
         self.poll_sec = max(0.5, float(poll_sec))
         self._region: Optional[Tuple[int, int, int, int]] = None
         self._rec = None
+        # 숫자 CNN (2026-06-10 v16): XP도 green_mask 전처리 적용 시 세그 깔끔
+        # (raw 14박스 노이즈 → green전처리 11박스 정확, 실측 확인). 좌표
+        # digit_cnn 재사용 — XP 자릿수 삽입/오독 해결. 빈/실패시 PaddleOCR.
+        self._digit_cnn = None
+        try:
+            from .digit_cnn import DigitCnn
+            _cnn_p = pathlib.Path(__file__).resolve().parent / "digit_cnn.onnx"
+            self._digit_cnn = DigitCnn(str(_cnn_p))
+        except Exception:
+            self._digit_cnn = None
         self._lock = threading.Lock()
         self._latest_frame: Optional[np.ndarray] = None
         self._latest_origin: Tuple[int, int] = (0, 0)
@@ -279,21 +289,34 @@ class XpOcr:
                            f"frame={frame.shape[1]}x{frame.shape[0]}")
             return
         crop = frame[fy:fy + fh, fx:fx + fw]
-        # 원본 3x 확대 (cooldown_ocr 과 동일 기법).
-        up = cv2.resize(
-            crop, (crop.shape[1] * 3, crop.shape[0] * 3),
-            interpolation=cv2.INTER_CUBIC,
-        )
-        try:
-            out = self._rec.predict(up)
-        except Exception as e:
-            self._last_diag = f"predict err: {e}"
-            self._consecutive_fail += 1
-            if self._consecutive_fail in (1, 5, 20):
-                self._emit(f"[XP-OCR] predict err: {e}")
-            return
-        text = self._extract_text(out)
+        # CNN용 green_mask 전처리(초록 글씨만 → 세그 깔끔). HP/MP와 동일 기법.
+        from .hpmp import _preprocess_for_ocr
+        up = _preprocess_for_ocr(crop, upscale=3, thr=20)
+        # 1순위: 숫자 CNN 세그+분류. 빈/실패면 PaddleOCR fallback(원본 3x).
+        text = self._cnn_digits(up)
+        if not text:
+            up = cv2.resize(
+                crop, (crop.shape[1] * 3, crop.shape[0] * 3),
+                interpolation=cv2.INTER_CUBIC,
+            )
+            try:
+                out = self._rec.predict(up)
+            except Exception as e:
+                self._last_diag = f"predict err: {e}"
+                self._consecutive_fail += 1
+                if self._consecutive_fail in (1, 5, 20):
+                    self._emit(f"[XP-OCR] predict err: {e}")
+                return
+            text = self._extract_text(out)
         xp = self._parse_int(text)
+        # 숫자 CNN 학습 데이터 수집 (env OB_COLLECT_DIGITS=1 일 때만).
+        # 파싱 성공한 text 의 숫자열을 라벨 후보로 (박스수 일치 시만 채택).
+        try:
+            from . import digit_collect
+            if digit_collect.enabled():
+                digit_collect.collect("xp", up, text if xp is not None else "")
+        except Exception:
+            pass
         now_mono = time.monotonic()
         # 2026-04-23: throttled raw 로그 (5초당 1회) — 스파이크 패턴 추적용.
         raw_log_due = (now_mono - self._last_raw_log_ts) >= 5.0
@@ -345,6 +368,21 @@ class XpOcr:
             self._emit(f"[XP-OCR-RAW] ok xp={xp} text={text!r} "
                        f"per_hour={self._last_xp_per_hour}")
             self._last_raw_log_ts = now_mono
+
+    def _cnn_digits(self, up) -> str:
+        """전처리 이미지 → 숫자 CNN 세그+분류 → 숫자열. 미사용/실패시 ''."""
+        if self._digit_cnn is None or not self._digit_cnn.ready():
+            return ""
+        try:
+            from .ocr import _segment_digit_boxes
+            boxes = _segment_digit_boxes(up)
+            if not boxes:
+                return ""
+            patches = [up[y:y + h, x:x + w] for (x, y, w, h) in boxes]
+            labels = self._digit_cnn.predict(patches)
+            return "".join(str(d) for d in labels)
+        except Exception:
+            return ""
 
     @staticmethod
     def _extract_text(out) -> str:

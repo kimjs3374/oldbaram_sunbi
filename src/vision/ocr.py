@@ -25,7 +25,6 @@ os.environ.setdefault("FLAGS_use_mkldnn", "0")
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 
 import cv2
-import easyocr
 import numpy as np
 from paddleocr import TextRecognition
 
@@ -283,8 +282,8 @@ class Ocr:
     def __init__(self, coord_w=105, coord_h=28, coord_right_pad=115,
                  coord_bottom_pad=4, coord_upscale=4,
                  map_w=400, map_h=40, map_top_pad=0, map_upscale=3,
-                 map_left_pad=-1, gpu=True, coord_jump_max=60,
-                 coord_reject_max=3,
+                 map_left_pad=-1, gpu=True, coord_jump_max=10,
+                 coord_reject_max=3, map_change_coord_hint=20,
                  map_interval_s=2.0, coord_interval_s=0.1):
         self.coord_w = coord_w
         self.coord_h = coord_h
@@ -300,6 +299,10 @@ class Ocr:
         # 연속 reject N회 초과 시 강제 수락: 이동 큰 상황에서 계속 reject되어
         # 좌표가 과거 값에 고착되는 현상 방지 (실측: 58,34 고착 12초 버그).
         self.coord_reject_max = coord_reject_max
+        # 맵 OCR 지연 보정(2026-06-08): 좌표가 직전 대비 이 칸수 이상 점프 +
+        # pending 에 새 known 맵 후보 존재 = 맵 경계 통과 신호 → pending 즉시 승격.
+        # 근거: 같은맵 정상 이동 0~8칸(2016건)/21칸+ 전환(72건). 20이면 안전 분리.
+        self.map_change_coord_hint = map_change_coord_hint
         self._reject_count = 0
         # 맵 OCR 스로틀: paddleocr가 40~100ms 튀어 루프 FPS를 깎으므로
         # 이 간격 안이면 이전 raw 텍스트 재사용. 맵 전환은 초 단위라 충분.
@@ -326,15 +329,27 @@ class Ocr:
         # 좌표: EasyOCR. 2026-04-21 GPU 경합으로 9ms→800ms 로 튀는 현상 →
         # healer_worker 에서 gpu=False 로 CPU 강제 가능.
         # 진단 로그에 실제 device 명시 (사용자 복사 반영 여부 검증용).
-        easy_kwargs = dict(gpu=gpu, verbose=False)
-        if _EASYOCR_DIR.is_dir() and (_EASYOCR_DIR / "craft_mlt_25k.pth").exists():
-            easy_kwargs["model_storage_directory"] = str(_EASYOCR_DIR)
-            easy_kwargs["download_enabled"] = False
-        self.digit = easyocr.Reader(["en"], **easy_kwargs)
+        # 좌표 인식: 경량 CNN(digit_cnn.onnx) 우선. 있으면 EasyOCR(PyTorch)
+        # 미로딩 → torch 회피 + 해상도 무관(augment 학습). 없으면 fallback.
+        from .digit_cnn import DigitCnn
+        _cnn_path = (pathlib.Path(__file__).resolve().parent
+                     / "digit_cnn.onnx")
+        self._digit_cnn = DigitCnn(_cnn_path)
+        self._use_coord_cnn = self._digit_cnn.ready()
         self._easy_gpu = bool(gpu)
-        self._easy_device_note = (
-            "GPU" if bool(gpu) else "CPU(forced)"
-        )
+        if self._use_coord_cnn:
+            self.digit = None
+            self._easy_device_note = "cnn-onnx(no-torch)"
+        else:
+            import easyocr
+            easy_kwargs = dict(gpu=gpu, verbose=False)
+            if _EASYOCR_DIR.is_dir() and (_EASYOCR_DIR / "craft_mlt_25k.pth").exists():
+                easy_kwargs["model_storage_directory"] = str(_EASYOCR_DIR)
+                easy_kwargs["download_enabled"] = False
+            self.digit = easyocr.Reader(["en"], **easy_kwargs)
+            self._easy_device_note = (
+                "GPU" if bool(gpu) else "CPU(forced)"
+            )
         # 맵: PaddleOCR korean recognition. tight crop이라 detection 불필요.
         # 2026-04-21: CPU 강제. GPU 는 YOLO 전용.
         map_kwargs = dict(
@@ -353,8 +368,9 @@ class Ocr:
         if self.map is None:
             self.map = TextRecognition(**map_kwargs)
         # warmup
-        self.digit.readtext(np.zeros((60, 400, 3), dtype=np.uint8),
-                            allowlist="0123456789 ", detail=0)
+        if self.digit is not None:
+            self.digit.readtext(np.zeros((60, 400, 3), dtype=np.uint8),
+                                allowlist="0123456789 ", detail=0)
         list(self.map.predict(np.zeros((48, 320, 3), dtype=np.uint8)))
         # 맵 OCR 비동기 워커 (선택). attach_map_worker 로 붙이면 read() 의
         # 맵 블록이 비블로킹으로 전환 (메인 루프에서 PaddleOCR predict 를
@@ -685,6 +701,32 @@ class Ocr:
             out.extend([x for x in texts if x])
         return out
 
+    def _read_digits_cnn(self, cc) -> Tuple[str, str]:
+        """좌표 숫자를 경량 CNN으로 인식 (해상도 무관, torch 불필요, 배치).
+
+        _segment_digit_boxes 로 숫자 분리 → 각 박스를 CNN(onnx)으로 0~9 분류.
+        """
+        boxes = _segment_digit_boxes(cc)  # x순 정렬
+        patches = [cc[y:y + h, x:x + w] for (x, y, w, h) in boxes]
+        labels = self._digit_cnn.predict(patches)
+        s = "".join(str(d) for d in labels)
+        return s, s
+
+    def _read_digits_template(self, cc) -> Tuple[str, str]:
+        """좌표 숫자를 템플릿 매칭으로 인식 (EasyOCR 대체, ~1ms, torch 불필요).
+
+        _segment_digit_boxes 로 숫자 분리 → 각 박스를 0~9 템플릿과 SSD 매칭.
+        """
+        boxes = _segment_digit_boxes(cc)  # x순 정렬
+        out = []
+        for (x, y, w, h) in boxes:
+            patch = cc[y:y + h, x:x + w]
+            d = self._coord_matcher.match(patch)
+            if d is not None:
+                out.append(str(d))
+        s = "".join(out)
+        return s, s
+
     def _read_digits(self, cc) -> Tuple[str, str]:
         """EasyOCR 숫자 읽기. (raw_text, digits_only).
 
@@ -696,6 +738,8 @@ class Ocr:
         → 평상 속도가 곧 최악 속도 (수십 ms 내).
         EasyOCR API 변경 대비 readtext fallback.
         """
+        if getattr(self, "_use_coord_cnn", False):
+            return self._read_digits_cnn(cc)
         try:
             H, W = cc.shape[:2]
             gray = cv2.cvtColor(cc, cv2.COLOR_BGR2GRAY) if cc.ndim == 3 else cc
@@ -713,6 +757,128 @@ class Ocr:
         raw = " ".join(ct) if ct else ""
         digits = re.sub(r"\D", "", raw)
         return raw, digits
+
+    def _filter_coord_jump(self, coord, cmp_m):
+        """같은맵 좌표 점프 필터 — 축별 독립 클램프.
+
+        반환: 보정된 좌표(또는 reject 시 None). 부수효과로 _reject_count/
+        _last_coord 갱신. coord/last 둘 중 None이면 그대로 통과.
+
+        축별 클램프 (2026-06-10 v11): 좌표 OCR ~10-15Hz(65~100ms 주기)라
+        같은맵 정상 프레임간 이동은 측정상 ≤7타일(99%가 ≤3). 한 축만 jump_max
+        초과 = 그 축 CNN 숫자 오독(다른 축은 정상 단조). 튀는 축만 직전값
+        유지하고 정상 축은 수락 → x↔진동 제거하며 추종 유지.
+        (healer-37 2026-06-10 15:20 x 1↔18 진동·y 정상단조 16s 정체 대응.
+        기존 60은 same_map에 무의미하게 커 d=17 진동이 통과했음.)
+        양축 동시 초과만 reject(좌표계 변화 가능) + 연속이면 강제수락(고착 방지).
+        """
+        if coord is None or self._last_coord is None:
+            return coord
+        same_map = (bool(cmp_m) and bool(self._last_map)
+                    and cmp_m == self._last_map)
+        if not same_map:
+            # 맵이 다름(또는 OCR 맵 미상) — jump 검사 스킵, 새 맵 좌표 수락.
+            # 이전 맵 _last_coord는 무효 → 리셋.
+            self._reject_count = 0
+            if bool(cmp_m) and bool(self._last_map):
+                self._last_coord = None
+            return coord
+        # 맵 OCR 지연 보호: 같은맵명인데 pending에 새 정상맵 후보 존재 =
+        # 맵 경계 통과 중(옛 맵명 + 새 맵 좌표) → jump 필터 스킵해 새 좌표
+        # 보존. 아래 map_change_coord_hint 블록이 pending 승격 처리.
+        # (jump_max를 10으로 낮추면서 (22,1)→(9,28) 류 맵전환 점프가
+        # 막히지 않도록. v11. v13: 멤버십→_is_admissible_map(base 검증)로 완화,
+        # 격수 새맵 닭-달걀 회귀 대응.)
+        if (self._pending_map and self._pending_map != self._last_map
+                and self._is_admissible_map(self._pending_map)):
+            self._reject_count = 0
+            return coord
+        lx, ly = self._last_coord
+        nx, ny = coord
+        jx = abs(nx - lx) > self.coord_jump_max
+        jy = abs(ny - ly) > self.coord_jump_max
+        if jx and jy:
+            # 양축 동시 급변 — 좌표계 변화/대량 노이즈. 연속되면 실제로 간주.
+            self._reject_count += 1
+            if self._reject_count <= self.coord_reject_max:
+                return None
+            self._reject_count = 0
+            return coord
+        if jx or jy:
+            # 한 축만 급변 = 그 축 오독. 튀는 축만 직전값 유지.
+            self._reject_count = 0
+            return (lx if jx else nx, ly if jy else ny)
+        self._reject_count = 0
+        return coord
+
+    def _is_admissible_map(self, raw_m: str) -> bool:
+        """raw_m 을 새 맵으로 승격해도 되는 정상 맵명인지 (v13 2026-06-10).
+
+        ① known_maps 미설정(standalone) → 허용(기존 동작).
+        ② known_maps 멤버 → 허용 (빠른 경로).
+        ③ knownmaps.txt base 로 canonical 복원 가능 → 허용. 격수가 처음 보는
+           맵도 base 만 정상이면 인정 — 격수는 known_maps를 자기 OCR로 채우므로
+           멤버십만 요구하면 새 맵을 영영 못 읽는 닭-달걀에 빠짐(v10 회귀).
+           오독('전미국22')은 base 매칭 실패라 여기서 거부됨.
+        """
+        if not self._known_maps:
+            return True
+        if raw_m in self._known_maps:
+            return True
+        if _USER_KNOWN_BASES and _canonicalize_via_user_bases(raw_m) is not None:
+            return True
+        return False
+
+    def _gate_map_name(self, raw_m: str) -> str:
+        """맵 이름 pending 게이트 — raw OCR을 채택맵으로 확정/거부.
+
+        반환: 채택된 맵 이름(_last_map). 부수효과로 _last_map/_pending_map 갱신.
+
+        화이트리스트 거부 (2026-06-10 v10): 격수 known_maps는 신뢰 정답집합.
+        그 밖의 값은 2프레임 연속이어도 새 맵으로 승격하지 않고 직전 맵 유지.
+        교정(이름 바꿔치기)이 아닌 거부라 새 오류를 못 만든다 —
+        오독('전미국22(1) (공)' 등)은 정의상 known_maps 밖이라 100% 차단.
+        (healer-37 2026-06-10 15:05 오독 9연발이 2프레임 게이트를 뚫고
+        healer_map으로 채택돼 trail 토글·MAP-SEQ 가짜발화 유발한 사고 대응.)
+        _known_maps가 비면(standalone/격수 데이터 미수신) 기존 동작 유지.
+        """
+        if not self._last_map:
+            self._last_map = raw_m
+            self._pending_map = ""
+        elif raw_m == self._last_map:
+            self._pending_map = ""
+        elif _is_ocr_noise(raw_m, self._last_map):
+            # OCR 1글자 한글 노이즈(예: '선비5-5(5' ↔ '선비족5-5(5').
+            # 가짜 MAP-SEQ-EDGE 차단 + canonical 매핑.
+            # v5.17: known_maps 멤버십 우선. 한쪽만 known_maps 에 있으면
+            # 그쪽으로 정렬(격수 정답 우선). 둘 다 있거나 둘 다 없으면
+            # 긴 쪽 채택(한글 OCR 글자 누락 ≫ 삽입).
+            r_known = raw_m in self._known_maps
+            l_known = self._last_map in self._known_maps
+            if r_known and not l_known:
+                self._last_map = raw_m
+            elif l_known and not r_known:
+                raw_m = self._last_map
+            elif len(raw_m) > len(self._last_map):
+                self._last_map = raw_m
+            else:
+                raw_m = self._last_map
+            self._pending_map = ""
+        elif raw_m == self._pending_map and self._is_admissible_map(raw_m):
+            # v13 (2026-06-10): 2프레임 연속 + "정상 맵명"이면 승격.
+            # 정상 = known_maps 멤버 OR knownmaps.txt base 복원가능.
+            # v10은 멤버십만 봐서 격수(known_maps를 자기 OCR로 채움)가 처음
+            # 가는 맵을 영영 거부 → '선비족입구' 고착 회귀(닭-달걀). base 검증
+            # 추가로 정상 새맵('선비족2')은 통과, 오독('전미국22')은 base 탈락.
+            self._last_map = raw_m
+            self._known_maps.add(raw_m)  # 자동 학습 → 다음부턴 멤버(빠른경로)
+            self._pending_map = ""
+        else:
+            # 미확인 후보(오독 포함) — 직전 맵 유지(hold). pending에만 기록해
+            # 진짜 새 맵이면 다음 프레임에 멤버십 통과 시 승격.
+            self._pending_map = raw_m
+            raw_m = self._last_map
+        return raw_m
 
     def read(self, frame: np.ndarray) -> OcrResult:
         # 방어: 좌표 OCR은 밝기/오버레이 간섭에 민감 → 1차 실패 시 다른 threshold로
@@ -828,34 +994,7 @@ class Ocr:
                             best = km
                 if best:
                     raw_m = best
-            if not self._last_map:
-                self._last_map = raw_m
-                self._pending_map = ""
-            elif raw_m == self._last_map:
-                self._pending_map = ""
-            elif _is_ocr_noise(raw_m, self._last_map):
-                # OCR 1글자 한글 노이즈(예: '선비5-5(5' ↔ '선비족5-5(5').
-                # 가짜 MAP-SEQ-EDGE 차단 + canonical 매핑.
-                # v5.17: known_maps 멤버십 우선. 한쪽만 known_maps 에 있으면
-                # 그쪽으로 정렬(격수 정답 우선). 둘 다 있거나 둘 다 없으면
-                # 긴 쪽 채택(한글 OCR 글자 누락 ≫ 삽입).
-                r_known = raw_m in self._known_maps
-                l_known = self._last_map in self._known_maps
-                if r_known and not l_known:
-                    self._last_map = raw_m
-                elif l_known and not r_known:
-                    raw_m = self._last_map
-                elif len(raw_m) > len(self._last_map):
-                    self._last_map = raw_m
-                else:
-                    raw_m = self._last_map
-                self._pending_map = ""
-            elif raw_m == self._pending_map:
-                self._last_map = raw_m
-                self._pending_map = ""
-            else:
-                self._pending_map = raw_m
-                raw_m = self._last_map
+            raw_m = self._gate_map_name(raw_m)
         # 좌표 파싱: EasyOCR이 "0076"을 "007 6"처럼 공백 삽입하는 케이스 있어
         # regex 단독으론 마지막 자리 손실. contour 개수로 직접 분할.
         coord: Optional[Tuple[int, int]] = None
@@ -886,32 +1025,27 @@ class Ocr:
         # 판정. raw_m_fresh가 _last_map과 다르면 실제 맵 전환이므로 jump 검사 스킵.
         # 또한 맵 달라진 경우 _last_coord를 None으로 리셋 (다음 프레임에 새 좌표로
         # 재설정) — 이전 맵 좌표가 계속 비교 기준으로 살아있지 않도록.
-        if coord is not None and self._last_coord is not None:
-            cmp_m = raw_m_fresh if raw_m_fresh else raw_m
-            # 맵 이름은 정확 일치만 "같은 맵"으로 간주.
-            # 과거 _map_similar(교집합 60%)는 '대방성' vs '대방성입구' 같은
-            # prefix 확장을 True로 판정 → pending 메커니즘 무력화 + 맵 전환 시
-            # 새 좌표가 jump 필터에 걸려 reject 고착.
-            same_map = (bool(cmp_m) and bool(self._last_map)
-                        and cmp_m == self._last_map)
-            if same_map:
-                dx = abs(coord[0] - self._last_coord[0])
-                dy = abs(coord[1] - self._last_coord[1])
-                if dx > self.coord_jump_max or dy > self.coord_jump_max:
-                    self._reject_count += 1
-                    if self._reject_count <= self.coord_reject_max:
-                        coord = None  # reject
-                    else:
-                        # 강제 수락: 큰 점프가 반복되면 실제 이동으로 간주.
-                        self._reject_count = 0
-                else:
-                    self._reject_count = 0
-            else:
-                # 맵이 다름(또는 OCR 맵 미상) — jump 검사 스킵, 새 맵 좌표 수락.
-                # 이전 맵 _last_coord는 무효 → 리셋.
-                self._reject_count = 0
-                if bool(cmp_m) and bool(self._last_map):
-                    self._last_coord = None
+        coord = self._filter_coord_jump(
+            coord, raw_m_fresh if raw_m_fresh else raw_m)
+
+        # 맵 OCR 지연 보정(2026-06-08): 격수 맵 이름 OCR이 좌표보다 늦게 따라오는
+        # 경우, pending 게이트(2프레임 연속 요구)가 1~수초간 옛 맵명을 유지 →
+        # 힐러가 '옛 맵명 + 새 맵 좌표'를 받아 같은-맵 거짓 점프로 오판
+        # (healer 213226 로그: 선비족2 (22,1)→(9,28) d=40 jump reject 다발).
+        # 좌표가 직전 대비 크게 점프 + pending 에 새 정상 맵 후보가 동시에 존재 =
+        # 맵 경계 통과 신호 → pending 즉시 승격해 좌표와 같은 프레임에 새 맵명 송신.
+        # v13: 멤버십 → _is_admissible_map(base 검증)로 완화 (격수 새맵 닭-달걀).
+        if (coord is not None and self._last_coord is not None
+                and self._pending_map
+                and self._pending_map != self._last_map
+                and self._is_admissible_map(self._pending_map)):
+            mv = (abs(coord[0] - self._last_coord[0])
+                  + abs(coord[1] - self._last_coord[1]))
+            if mv >= self.map_change_coord_hint:
+                self._last_map = self._pending_map
+                self._known_maps.add(self._pending_map)
+                raw_m = self._pending_map
+                self._pending_map = ""
 
         if coord is not None:
             self._last_coord = coord

@@ -51,15 +51,6 @@ def collect(mw) -> dict:
             mw.cfg.cooldown, "buff_region_w", 0)),
         "buff_region_h": int(getattr(
             mw.cfg.cooldown, "buff_region_h", 0)),
-        # Chat (자리바꾸기 팝업 감지) region — 2026-04-21.
-        "chat_region_x": int(getattr(
-            mw.cfg.cooldown, "chat_region_x", -1)),
-        "chat_region_y": int(getattr(
-            mw.cfg.cooldown, "chat_region_y", -1)),
-        "chat_region_w": int(getattr(
-            mw.cfg.cooldown, "chat_region_w", 0)),
-        "chat_region_h": int(getattr(
-            mw.cfg.cooldown, "chat_region_h", 0)),
         # HP/MP region (2026-04-20 신규) — 양측 PC 모두 OCR 사용.
         "hp_region_x": int(getattr(
             mw.cfg.cooldown, "hp_region_x", -1)),
@@ -82,9 +73,7 @@ def collect(mw) -> dict:
             if hasattr(mw, "hp_max_spin") else 0,
         "mp_max": int(mw.mp_max_spin.value())
             if hasattr(mw, "mp_max_spin") else 0,
-        # 자힐/공력증강 임계치 (2026-04-20).
-        "self_heal_hp_thr": int(
-            mw.skill_dlg.self_heal_hp_spin.value()),
+        # 공력증강 임계치 (2026-04-20).
         "gyoungryeok_mp_thr": int(
             mw.skill_dlg.gyoungryeok_mp_spin.value()),
         # F11 통합 실행 (A+B) 토글 (2026-04-20 Patch 2.12).
@@ -145,6 +134,7 @@ def collect(mw) -> dict:
         "skill_spins": {n: sp.value()
                          for n, sp in mw.skill_spins.items()},
         "parlyuk_offset": mw.parlyuk_spin.value(),
+        "parlyuk_maps": mw.parlyuk_maps_edit.text(),
         # Window geometry
         "win_x": int(mw.x()),
         "win_y": int(mw.y()),
@@ -317,18 +307,6 @@ def load(mw):
             mw.lbl_buff_region.setText(
                 f"버프 영역: ({bx},{by}) {bw}×{bh}"
             )
-    # Chat region 복원 (자리바꾸기 팝업 감지 영역).
-    cx = g("chat_region_x"); cy = g("chat_region_y")
-    cw = g("chat_region_w"); ch = g("chat_region_h")
-    if cx is not None and cw is not None and int(cw) > 0 and int(cx) >= 0:
-        mw.cfg.cooldown.chat_region_x = int(cx)
-        mw.cfg.cooldown.chat_region_y = int(cy)
-        mw.cfg.cooldown.chat_region_w = int(cw)
-        mw.cfg.cooldown.chat_region_h = int(ch)
-        if hasattr(mw, "lbl_chat_region"):
-            mw.lbl_chat_region.setText(
-                f"채팅 영역: ({cx},{cy}) {cw}×{ch}"
-            )
     # HP/MP region 복원 (2026-04-20).
     for _k in ("hp", "mp"):
         _x = g(f"{_k}_region_x"); _y = g(f"{_k}_region_y")
@@ -358,13 +336,7 @@ def load(mw):
             mw.cfg.cooldown.mp_max = int(v)
     except Exception:
         pass
-    # 자힐/공력증강 임계치 복원 — skill_dlg 가 만들어져 있어야 안전.
-    try:
-        v = g("self_heal_hp_thr")
-        if v is not None:
-            mw.skill_dlg.self_heal_hp_spin.setValue(int(v))
-    except Exception:
-        pass
+    # 공력증강 임계치 복원 — skill_dlg 가 만들어져 있어야 안전.
     try:
         v = g("gyoungryeok_mp_thr")
         if v is not None:
@@ -568,6 +540,8 @@ def load(mw):
                 pass
     if g("parlyuk_offset") is not None:
         mw.parlyuk_spin.setValue(int(g("parlyuk_offset")))
+    if g("parlyuk_maps") is not None:
+        mw.parlyuk_maps_edit.setText(str(g("parlyuk_maps")))
     # Window geometry 복원 — 화면 밖이면 무시.
     try:
         wx = g("win_x"); wy = g("win_y")

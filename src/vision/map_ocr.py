@@ -132,15 +132,19 @@ class MapOcrWorker:
             )
             if _KOREAN_REC_DIR.is_dir():
                 kwargs["model_dir"] = str(_KOREAN_REC_DIR)
-            # 2026-04-21: CPU 강제. GPU 는 YOLO 전용. PaddleOCR + YOLO GPU
-            # 경합으로 predict 수백ms 치솟는 현상 차단. 버전별로 키 이름
-            # 다르므로 순차 시도.
+            # 2026-06-10: GPU 우선으로 전환. 기존 CPU 강제는 "YOLO가 GPU" 전제
+            # 였으나 현재 YOLO는 ONNX CPU(device=-1)라 GPU 비어있음. 맵 PaddleOCR
+            # 이 CPU(267ms)를 점유해 YOLO/좌표 ONNX와 경합 → 스파이크 유발.
+            # GPU로 옮기면 CPU 여유 → 좌표 지연 해소. 게임 GPU 경합은 맵 OCR이
+            # 0.5s throttle 이라 점유 짧음. GPU 없으면 CPU fallback(저사양 안전).
             note_prefix = (f"local {_KOREAN_REC_DIR}" if _KOREAN_REC_DIR.is_dir()
                            else "online korean_PP-OCRv5_mobile_rec")
             attempts = [
+                ({"device": "gpu"}, "GPU(device=gpu)"),
+                ({"use_gpu": True}, "GPU(use_gpu=True)"),
                 ({"device": "cpu"}, "CPU(device=cpu)"),
                 ({"use_gpu": False}, "CPU(use_gpu=False)"),
-                ({}, "DEFAULT(GPU?)"),
+                ({}, "DEFAULT"),
             ]
             for extra, mode in attempts:
                 try:

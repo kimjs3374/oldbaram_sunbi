@@ -2,10 +2,10 @@ capture:
   monitor_index: 1
   fps_target: 60
 vision:
-  imgsz: 640
+  imgsz: 416
   conf: 0.25
   half: true
-  device: 0
+  device: -1   # ONNX CPU 강제 (GPU 경합 spike 회피)
 ocr:
   coord_w: 160
   coord_h: 28

@@ -43,10 +43,6 @@ class AttackerWorker(QtCore.QThread):
         self._pending_cd_region: Optional[Tuple[int, int, int, int]] = None
         self._cd_region_cleared: bool = False
         self._pending_cd_skills: Optional[list] = None
-        # 격수 버프(혼마술) 영역 pending — Attacker 생성 전 GUI 에서 지정 대비.
-        # 힐러/격수 공용 buff_region_* 과 동일 영역 (사용자 2026-04-20).
-        self._pending_buff_region: Optional[Tuple[int, int, int, int]] = None
-        self._buff_region_cleared: bool = False
         # HP/MP 영역 pending.
         self._pending_hp_region: Optional[Tuple[int, int, int, int]] = None
         self._hp_region_cleared: bool = False
@@ -101,25 +97,6 @@ class AttackerWorker(QtCore.QThread):
         if self._app is not None:
             try:
                 self._app.clear_cd_region()
-            except Exception:
-                pass
-
-    # ---- 격수 버프 영역 API (힐러와 이름 공용. 혼마술 감시용) ----
-    def set_buff_region(self, x: int, y: int, w: int, h: int) -> None:
-        self._pending_buff_region = (int(x), int(y), int(w), int(h))
-        self._buff_region_cleared = False
-        if self._app is not None:
-            try:
-                self._app.set_buff_region(int(x), int(y), int(w), int(h))
-            except Exception as e:
-                self.log.warning(f"[buff] set_region 적용 실패: {e}")
-
-    def clear_buff_region(self) -> None:
-        self._pending_buff_region = None
-        self._buff_region_cleared = True
-        if self._app is not None:
-            try:
-                self._app.clear_buff_region()
             except Exception:
                 pass
 
@@ -401,15 +378,6 @@ class AttackerWorker(QtCore.QThread):
                     self._app.clear_cd_region()
             except Exception as _e:
                 self.log.warning(f"[cd] pending 적용 실패: {_e}")
-            # 격수 버프(혼마술) 영역 pending 적용.
-            try:
-                if self._pending_buff_region is not None:
-                    x, y, w, h = self._pending_buff_region
-                    self._app.set_buff_region(x, y, w, h)
-                elif self._buff_region_cleared:
-                    self._app.clear_buff_region()
-            except Exception as _e:
-                self.log.warning(f"[buff] pending 적용 실패: {_e}")
             # 격수 HP/MP 영역 pending 적용.
             try:
                 if self._pending_hp_region is not None:
