@@ -84,6 +84,8 @@ class HealerWorker(QtCore.QThread):
         # 2026-06-11: 현재 프레임 red/white raw (포탈 진입 전 빨탭 확인 게이트용).
         self._cur_red_raw: bool = False
         self._cur_white_raw: bool = False
+        # 포탈 진입 로그 1회 게이트 (맵 도달 시 리셋).
+        self._portal_enter_logged: bool = False
         self.yolo_every_n = 1
         # --- 저사양 모드 런타임 튠 (main_window._on_toggle_low_spec이 setattr). ---
         # 0/기본값이면 효과 없음. YoloRunner.imgsz는 런타임 값 치환 가능.
@@ -1449,6 +1451,9 @@ class HealerWorker(QtCore.QThread):
                     pass
                 red_raw = det is not None  # RED bbox 검출 (override 전).
                 white_raw = det_white is not None  # WHITE bbox 검출 (가드용).
+                # 맵전환 전 빨탭 확인 게이트용 (_decide_move_raw 의 exit 분기에서 참조).
+                self._cur_red_raw = red_raw
+                self._cur_white_raw = white_raw
                 atk.red_tab = red_raw
                 # 따라가기 전용 모드: 빨탭 무시 → COMBAT 진입 차단.
                 # red_raw 자체는 유지(디버그/로그용) but atk.red_tab=False로
@@ -2710,6 +2715,7 @@ class HealerWorker(QtCore.QThread):
             if not map_neq:
                 if hasattr(fol, "cancel_force_exit"):
                     fol.cancel_force_exit()
+                self._portal_enter_logged = False  # 새 맵 도달 → 게이트 리셋.
                 self.log.info(
                     "[FORCE-EXIT-CANCEL] 격수와 같은 맵 도달 → 해제, 격수 추종"
                 )
@@ -2719,6 +2725,24 @@ class HealerWorker(QtCore.QThread):
                 # 손으로 넘겨주는 시간 로스가 더 큼. 빨탭 확정 후 exit.
                 return "-", "EXIT-HOLD: 본인빨탭 고정 대기(TAB-CONFIRM 중)"
             else:
+                # 2026-06-11 사용자 우선요구: 맵 이동 직전 본인 빨탭(red & !white)
+                # 확정을 무조건 확인하고 진입. 빨탭 없이 넘어가면 새맵서 본인
+                # 타겟/자힐 로스 → 손으로 넘겨야. follow_only(쩔)는 빨탭 자체를
+                # 안 쓰므로 게이트 면제(trail/좌표 추종으로 진입).
+                if not self.follow_only:
+                    red_ok = self._cur_red_raw and not self._cur_white_raw
+                    if not red_ok:
+                        return "-", (
+                            "PORTAL-WAIT 빨탭 미확정 → 진입 보류 "
+                            f"(red={self._cur_red_raw} white={self._cur_white_raw})"
+                        )
+                    if not self._portal_enter_logged:
+                        self.log.info(
+                            "[PORTAL-ENTER] 본인 빨탭 확정 확인 "
+                            f"(red={self._cur_red_raw} white={self._cur_white_raw})"
+                            " → 다음맵 진입"
+                        )
+                        self._portal_enter_logged = True
                 # 2026-06-11 근본수정: 포탈 좌표(_exit_coord) 직행 우선.
                 # 기존 exit_dir 방향키만으론 한 축만 밀어 x(또는 y) 안 맞으면
                 # 벽에 막혀 멍때림 (healer-120 follow_only 41s: 포탈 (7,0)인데
