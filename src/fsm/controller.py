@@ -125,10 +125,11 @@ class Follower:
         # B안: 오염 거부 임계.
         # 한 맵 내 연속 좌표가 점프 임계보다 크면 거부 (격수 순간이동 불가).
         # 맵 전환 직후 첫 좌표가 이전 맵 exit_coord 근처면 오염 → 거부.
-        # 2026-06-11 사용자 지적: 옛바는 1칸씩 이동 → 좌표는 맵이동 빼면 항상
-        # 연속(d=1). d≥3 점프는 물리불가 노이즈((19,9)→(19,4) d=5 류). trail에
-        # 들어가면 exit/추종 오염 → 포탈 못감. 8→3 (d=1~2 누락허용, d≥3 reject).
-        self._jump_reject_threshold: int = 3
+        # 2026-06-11 롤백: v28에서 3으로 낮췄다가 대참사 — 힐러가 UDP로 받는
+        # 격수 좌표는 수신주기로 d=3~7 정상(격수 화면은 d=1이지만 송신/수신
+        # 주기로 점프). 3으로 막으니 TRAIL-REJECT 1947회(push 245)로 trail 텅 빔
+        # → 추종 전멸. 8 복원. (19,4) 노이즈 문제는 jump_reject로 못 잡음 — 별도.
+        self._jump_reject_threshold: int = 8
         self._fresh_reject_threshold: int = 3
         # 맵별 "방금 리셋된 상태" 플래그 — 첫 push에 이전 맵 exit_coord 체크용.
         self._fresh_map_guard: dict = {}  # map_name → (exit_coord, expires_ts)
