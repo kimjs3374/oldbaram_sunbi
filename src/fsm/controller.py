@@ -125,7 +125,10 @@ class Follower:
         # B안: 오염 거부 임계.
         # 한 맵 내 연속 좌표가 점프 임계보다 크면 거부 (격수 순간이동 불가).
         # 맵 전환 직후 첫 좌표가 이전 맵 exit_coord 근처면 오염 → 거부.
-        self._jump_reject_threshold: int = 8
+        # 2026-06-11 사용자 지적: 옛바는 1칸씩 이동 → 좌표는 맵이동 빼면 항상
+        # 연속(d=1). d≥3 점프는 물리불가 노이즈((19,9)→(19,4) d=5 류). trail에
+        # 들어가면 exit/추종 오염 → 포탈 못감. 8→3 (d=1~2 누락허용, d≥3 reject).
+        self._jump_reject_threshold: int = 3
         self._fresh_reject_threshold: int = 3
         # 맵별 "방금 리셋된 상태" 플래그 — 첫 push에 이전 맵 exit_coord 체크용.
         self._fresh_map_guard: dict = {}  # map_name → (exit_coord, expires_ts)
