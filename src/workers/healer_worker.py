@@ -81,6 +81,9 @@ class HealerWorker(QtCore.QThread):
         self._parlyuk_maps: set = set()
         # 공력증강 hysteresis 상태 (2026-06-10): MP<임계 시작 → 90% 도달까지 시전.
         self._gyoung_active: bool = False
+        # 2026-06-11: 현재 프레임 red/white raw (포탈 진입 전 빨탭 확인 게이트용).
+        self._cur_red_raw: bool = False
+        self._cur_white_raw: bool = False
         self.yolo_every_n = 1
         # --- 저사양 모드 런타임 튠 (main_window._on_toggle_low_spec이 setattr). ---
         # 0/기본값이면 효과 없음. YoloRunner.imgsz는 런타임 값 치환 가능.

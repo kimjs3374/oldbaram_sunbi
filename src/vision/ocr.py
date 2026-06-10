@@ -282,7 +282,7 @@ class Ocr:
     def __init__(self, coord_w=105, coord_h=28, coord_right_pad=115,
                  coord_bottom_pad=4, coord_upscale=4,
                  map_w=400, map_h=40, map_top_pad=0, map_upscale=3,
-                 map_left_pad=-1, gpu=True, coord_jump_max=10,
+                 map_left_pad=-1, gpu=True, coord_jump_max=4,
                  coord_reject_max=3, map_change_coord_hint=20,
                  map_interval_s=2.0, coord_interval_s=0.1):
         self.coord_w = coord_w
@@ -797,17 +797,20 @@ class Ocr:
         nx, ny = coord
         jx = abs(nx - lx) > self.coord_jump_max
         jy = abs(ny - ly) > self.coord_jump_max
-        if jx and jy:
-            # 양축 동시 급변 — 좌표계 변화/대량 노이즈. 연속되면 실제로 간주.
+        if jx or jy:
+            # 옛바는 1칸씩 이동 → 같은맵 좌표 OCR 프레임간 정상 d는 작음
+            # (측정 99%가 ≤3). jump_max 초과 = CNN 좌표 자릿수 오독.
+            # 실증(2026-06-11 02:19:31): raw='00010004' — 정상 '0019xxxx'를
+            # CNN이 19→01, 9→04 로 오독해 (1,4) 유입. 직전 (19,9) 대비 y=5
+            # 점프였는데 jump_max=10 이라 새 통과 → (19,4) 가짜좌표 송신.
+            # → 급변 축만 직전값 클램프해 노이즈 제거(양축 동시면 둘 다 유지).
+            #   N프레임 연속 초과면 실제 이동(빠른이동/좌표계 변화)으로 강제수락
+            #   (고착 방지). 양축도 None 대신 클램프 → 추종 끊김 없이 옛 좌표 유지.
             self._reject_count += 1
             if self._reject_count <= self.coord_reject_max:
-                return None
+                return (lx if jx else nx, ly if jy else ny)
             self._reject_count = 0
             return coord
-        if jx or jy:
-            # 한 축만 급변 = 그 축 오독. 튀는 축만 직전값 유지.
-            self._reject_count = 0
-            return (lx if jx else nx, ly if jy else ny)
         self._reject_count = 0
         return coord
 
