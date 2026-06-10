@@ -449,11 +449,11 @@ class Follower:
         if getattr(s, "seq", 0) > 0 or getattr(s, "coord_valid", False):
             self._last_udp_time = now
 
-        # 맵 끝자리 OCR 오독 게이트 (pre-pipeline) — 격수 좌표 연속이면 맵명
-        # 변화를 오독으로 거부. 직후 _atk_prev_coord 갱신(다음 프레임 기준).
-        self._map_ocr_gate(s)
-        if getattr(s, "coord_valid", False):
-            self._atk_prev_coord = (s.x, s.y)
+        # 2026-06-11 v34 롤백: v33 _map_ocr_gate 비활성. min_jump=5 전제(맵전환=
+        # 격수좌표 급변)가 틀림 — 맵전환도 격수좌표 d<5 빈번(포탈 양쪽 좌표 유사)
+        # → 진짜 맵전환 83회 오독차단(CTRL-MAPCHG 12→3) 추종 전멸. 좌표연속성으론
+        # 맵전환/오독 구분 불가. 끝자리 오독은 다른 방법(측정 후) 필요.
+        # self._map_ocr_gate(s)  # 비활성 — 추종 전멸 유발
 
         # C안: 역방향 맵 복귀 디바운스 — **pre-pipeline 위치**.
         # 2026-04-15 수정: 과거엔 MAP-SEQ-EDGE/MAP-SYNC 설정 **뒤**에 있어
