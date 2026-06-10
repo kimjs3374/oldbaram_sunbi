@@ -84,6 +84,9 @@ class HealerWorker(QtCore.QThread):
         # 2026-06-11: 현재 프레임 red/white raw (포탈 진입 전 빨탭 확인 게이트용).
         self._cur_red_raw: bool = False
         self._cur_white_raw: bool = False
+        # red bbox 화면좌표 (self-target 구분 측정용 — PORTAL-ENTER 로그에 기록).
+        self._cur_red_cx: float = -1.0
+        self._cur_red_cy: float = -1.0
         # 포탈 진입 로그 1회 게이트 (맵 도달 시 리셋).
         self._portal_enter_logged: bool = False
         self.yolo_every_n = 1
@@ -1454,6 +1457,8 @@ class HealerWorker(QtCore.QThread):
                 # 맵전환 전 빨탭 확인 게이트용 (_decide_move_raw 의 exit 분기에서 참조).
                 self._cur_red_raw = red_raw
                 self._cur_white_raw = white_raw
+                self._cur_red_cx = float(det.cx) if det is not None else -1.0
+                self._cur_red_cy = float(det.cy) if det is not None else -1.0
                 atk.red_tab = red_raw
                 # 따라가기 전용 모드: 빨탭 무시 → COMBAT 진입 차단.
                 # red_raw 자체는 유지(디버그/로그용) but atk.red_tab=False로
@@ -2732,15 +2737,28 @@ class HealerWorker(QtCore.QThread):
                 if not self.follow_only:
                     red_ok = self._cur_red_raw and not self._cur_white_raw
                     if not red_ok:
+                        # 진입 보류 — 0.5s throttle 로그로 대기 사실 기록.
+                        _nw = time.time()
+                        if _nw - getattr(self, "_portal_wait_log_ts", 0.0) > 0.5:
+                            self._portal_wait_log_ts = _nw
+                            self.log.info(
+                                f"[PORTAL-WAIT] 맵={self.healer_map!r} 빨탭 미확정 "
+                                f"→ 진입 보류 (red={self._cur_red_raw} "
+                                f"white={self._cur_white_raw} "
+                                f"red_px=({self._cur_red_cx:.0f},"
+                                f"{self._cur_red_cy:.0f}))"
+                            )
                         return "-", (
                             "PORTAL-WAIT 빨탭 미확정 → 진입 보류 "
                             f"(red={self._cur_red_raw} white={self._cur_white_raw})"
                         )
                     if not self._portal_enter_logged:
                         self.log.info(
-                            "[PORTAL-ENTER] 본인 빨탭 확정 확인 "
-                            f"(red={self._cur_red_raw} white={self._cur_white_raw})"
-                            " → 다음맵 진입"
+                            f"[PORTAL-ENTER] 맵={self.healer_map!r} 본인 빨탭 확정 "
+                            f"→ 다음맵 진입 "
+                            f"(red={self._cur_red_raw} white={self._cur_white_raw} "
+                            f"red_px=({self._cur_red_cx:.0f},{self._cur_red_cy:.0f}) "
+                            f"h={h} exit={getattr(fol, '_exit_coord', None)})"
                         )
                         self._portal_enter_logged = True
                 # 2026-06-11 근본수정: 포탈 좌표(_exit_coord) 직행 우선.
