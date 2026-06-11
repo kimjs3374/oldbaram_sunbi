@@ -119,16 +119,17 @@ class _ScaledOverlay(QtWidgets.QWidget):
         self._apply_flags()
 
     def set_opacity(self, v: float) -> None:
-        """0.2 ~ 1.0 범위 투명도 멀티플라이어 적용. 실제로는 paintEvent 내부
+        """0.0 ~ 1.0 범위 투명도 멀티플라이어 적용. 실제로는 paintEvent 내부
         QColor alpha 값에 이 값을 곱해 렌더링. setWindowOpacity 를 쓰지 않아
         WA_TranslucentBackground 와 충돌해서 창이 사라지는 현상이 없다.
+        0.0 = 완전 투명(보이지 않음).
         """
         try:
             f = float(v)
         except Exception:
             f = 1.0
-        if f < 0.1:
-            f = 0.1
+        if f < 0.0:
+            f = 0.0
         elif f > 1.0:
             f = 1.0
         # 안전장치: setWindowOpacity 는 반드시 1.0 고정 (과거 저장값 잔재 제거).

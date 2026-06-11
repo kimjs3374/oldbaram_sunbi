@@ -195,16 +195,16 @@ class OverlayDialog(QtWidgets.QDialog):
             self.kind_chks[kind] = c
             grid.addWidget(c, row, 0)
             sld = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-            sld.setMinimum(10)
+            sld.setMinimum(0)
             sld.setMaximum(100)
             sld.setSingleStep(5)
             sld.setPageStep(10)
             sld.setValue(90)
-            sld.setToolTip(f"{label} 투명도 (10~100%). 낮을수록 투명.")
+            sld.setToolTip(f"{label} 투명도 (0~100%). 0=완전 투명, 낮을수록 투명.")
             self.kind_op_sliders[kind] = sld
             grid.addWidget(sld, row, 1)
             spn = QtWidgets.QSpinBox()
-            spn.setRange(10, 100)
+            spn.setRange(0, 100)
             spn.setValue(90)
             spn.setSuffix("%")
             spn.setToolTip(f"{label} 투명도 — 숫자 직접 입력 가능.")
@@ -242,7 +242,7 @@ class OverlayDialog(QtWidgets.QDialog):
 
     def set_kind_opacity(self, kind: str, pct: int) -> None:
         """프로그램(설정 복원)용 — 시그널 없이 슬라이더+스핀 동시 세팅."""
-        pct = max(10, min(100, int(pct)))
+        pct = max(0, min(100, int(pct)))
         for w in (self.kind_op_sliders.get(kind),
                   self.kind_op_spins.get(kind)):
             if w is None:

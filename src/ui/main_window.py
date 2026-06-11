@@ -1708,11 +1708,11 @@ class MainWindow(QtWidgets.QMainWindow):
         }.get(kind)
 
     def _overlay_opacity_for(self, kind: str) -> float:
-        """kind 별 투명도 (0.1~1.0). 스핀(숫자 입력) 값 기준."""
+        """kind 별 투명도 (0.0~1.0). 스핀(숫자 입력) 값 기준."""
         try:
             s = self.overlay_op_spins.get(kind)
             if s is not None:
-                return max(0.1, min(1.0, int(s.value()) / 100.0))
+                return max(0.0, min(1.0, int(s.value()) / 100.0))
         except Exception:
             pass
         return 0.9
@@ -1722,7 +1722,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ov = self._overlay_by_kind(kind)
         if ov is not None:
             try:
-                ov.set_opacity(max(0.1, min(1.0, int(v) / 100.0)))
+                ov.set_opacity(max(0.0, min(1.0, int(v) / 100.0)))
             except Exception:
                 pass
         # 스킬범위 오버레이는 자체 투명도 슬라이더 사용 — 여기서 건드리지 않음.
