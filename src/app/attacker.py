@@ -94,11 +94,10 @@ class Attacker:
         # 10~15칸 튐에도 MAP-SEQ-EDGE 오탐 발동해 힐러 추종 끊김 + TAB-CONFIRM 취소
         # (힐러1.txt 17:07:32/46, 08:00 오탐 재현). 25칸 = 진짜 워프/서브맵 전환 폭.
         self._warp_threshold = 25
-        # F1 수동 예고 — 격수(사람)가 포털 통과 3~5초 전 F1 눌러 힐러에게 예고.
-        # 눌린 뒤 _f1_window_sec 동안 map_change_pending=True 송신.
-        # 힐러는 이 플래그 활성화 구간 동안 B3 coord-follow를 차단 (스테일 좌표 오발사 방지).
-        self._f1_window_sec = 5.0
-        self._f1_pending_until = 0.0
+        # F1 (2026-06-12 변경): 기존 "맵전환 예고(map_change_pending)" 명령 제거 →
+        # 격수가 F1 누르면 힐러에게 "격수 빨탭 재고정 시퀀스 즉시 실행" 트리거.
+        # 카운터 증가분을 State.reanchor_seq 로 송신 → 힐러가 증가 감지 시 1회 발동.
+        self._reanchor_seq = 0
         # 좌표급변(=맵전환, 워프 거의 없음) 감지 시 맵이름 OCR 갱신까지
         # map_change_pending 강제 ON → 격수 맵OCR(RapidOCR) 지연을 좌표(0.01초)로 흡수.
         self._map_chg_until = 0.0
@@ -457,19 +456,19 @@ class Attacker:
             except Exception:
                 pass
 
-            # F1 에지 감지 — down 상태 0→1 전이 시 pending 창 개시.
+            # F1 에지 감지 (2026-06-12): down 0→1 전이 시 재고정 트리거 카운터++.
+            # 힐러가 reanchor_seq 증가 감지 → 빨탭 재고정 시퀀스 즉시 실행.
             if _HAVE_WIN32:
                 f1_down = bool(win32api.GetAsyncKeyState(_VK_F1) & 0x8000)
                 if f1_down and not self._f1_prev_down:
-                    self._f1_pending_until = time.time() + self._f1_window_sec
+                    self._reanchor_seq += 1
                     self.log(
-                        f"[ATK-F1] 맵전환 예고 활성 — 힐러 B3 차단 "
-                        f"{self._f1_window_sec:.1f}s"
+                        f"[ATK-F1] 격수 빨탭 재고정 트리거 송신 "
+                        f"seq={self._reanchor_seq}"
                     )
                 self._f1_prev_down = f1_down
             _t_now = time.time()
-            pending_now = ((_t_now < self._f1_pending_until)
-                           or (_t_now < self._map_chg_until))
+            pending_now = (_t_now < self._map_chg_until)
 
             # HP/MP 즉시 읽기 (픽셀 비율, 가벼움). 포커스 없을 땐 skip.
             _hp_pct = -1
@@ -495,6 +494,7 @@ class Attacker:
                 last_dir=self._last.last_dir,
                 map_seq=self._map_seq,
                 map_change_pending=pending_now,
+                reanchor_seq=self._reanchor_seq,
                 hp_pct=_hp_pct,
                 mp_pct=_mp_pct,
             )
@@ -606,8 +606,7 @@ class Attacker:
             # OCR 블록에서 map_seq가 증가했을 수 있으므로 송신 직전 재스탬프.
             st.map_seq = self._map_seq
             # 좌표급변(OCR블록에서 _map_chg_until 갱신됨) 반영 — OCR 후 재스탬프.
-            st.map_change_pending = ((time.time() < self._f1_pending_until)
-                                     or (time.time() < self._map_chg_until))
+            st.map_change_pending = (time.time() < self._map_chg_until)
             # 2026-04-22: 격수 YOLO 빨탭 인식 (이전엔 "빨탭 없음 → YOLO 불필요"
             # 로 스킵했으나 스킬범위 오버레이가 자기 빨탭 좌표를 요구 → 활성화).
             # 힐러와 동일 학습 가중치(cfg.vision.weights) 공유.

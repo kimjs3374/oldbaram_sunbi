@@ -2,6 +2,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import os
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -224,6 +225,24 @@ class HealerWorker(QtCore.QThread):
         # 2026-04-23 사용자 지시: 맵 전환 중 자힐이면 SEQ-B의 TAB×2 스킵하고
         # 새 맵 도착 후 worker가 TAB×2 시전해 격수 고정. pending 플래그.
         self._pending_tab_lock_until: float = 0.0
+        # TAB-LOCK 발동 거리 임계 (맨해튼). 기존 자힐복귀=10. 재고정 시퀀스=5.
+        self._pending_tab_lock_dist: int = 10
+        # ── 격수 빨탭 재고정 시퀀스 (2026-06-12) ──────────────────────────
+        # 별도 주기 유지보수 루틴. 트리거(AND): 같은맵 + 힐러HP 100% 3초+ 지속 +
+        # 빨탭 검출 + 60초 간격. 격수 F1(reanchor_seq 증가) 누르면 조건 무시 즉시.
+        # 흐름: TAB→HOME→TAB → 토글OFF → TAB → red&white 둘다 미검출 확인
+        #   (실패=abort 추종) → _pending_tab_lock(dist5)로 접근+TAB×2+재ON 위임.
+        # 진행 중(_reanchor_active) 동안 스케줄러 시전 유예(자힐/부활 정지).
+        self._reanchor_active: bool = False
+        self._reanchor_last_ts: float = 0.0
+        self._hp100_since: float = 0.0      # 힐러 HP 100% 연속 시작 시각.
+        self._last_reanchor_seq: int = 0     # 격수 F1 트리거 카운터 마지막 관측값.
+        try:
+            self._reanchor_interval_s: float = max(
+                5.0, float(os.environ.get("OB_REANCHOR_INTERVAL_S", "60")))
+        except Exception:
+            self._reanchor_interval_s = 60.0
+        self._reanchor_hp_hold_s: float = 3.0
         # 2026-04-24 자힐 중 빨탭 우클릭으로 격수 거리 좁히기. 0.5s 간격 throttle.
         self._seq_rclick_last_ts: float = 0.0
         # _hook_block_ab 진입 시점에 잡은 YOLO 빨탭 절대 화면 좌표. 자힐
@@ -562,6 +581,109 @@ class HealerWorker(QtCore.QThread):
         if bool(getattr(self, "follow_only", False)):
             return "따라가기만"
         return "전투중"
+
+    def _start_reanchor_sequence(self) -> None:
+        """격수 빨탭 재고정 시퀀스 시작 (별도 스레드, 2026-06-12).
+
+        1~3단계(self-target→토글OFF→TAB→clean확인)를 스레드에서 수행하고,
+        clean이면 _pending_tab_lock(dist5)에 4~6(접근+TAB×2+재ON)을 위임한다.
+        clean 실패면 토글 재ON 복원 후 종료(=격수 추종). 진행 중 _reanchor_active
+        =True → ready_gate가 스케줄러(자힐/부활) 시전 유예.
+        """
+        if self._reanchor_active:
+            return
+        self._reanchor_active = True
+        try:
+            t = threading.Thread(target=self._run_reanchor_sequence,
+                                 name="reanchor", daemon=True)
+            t.start()
+        except Exception as _e:
+            self._reanchor_active = False
+            self.log.warning(f"[REANCHOR] 스레드 시작 실패: {_e}")
+
+    def _run_reanchor_sequence(self) -> None:
+        _gap = 0.1
+        try:
+            from ..input.target_sequence import (
+                _press_vk, VK_TAB, VK_HOME, DEFAULT_SLOTS)
+            from ..input.numlock_cycle import press_numpad_scan, skill_lock_vk
+            _slots = list(DEFAULT_SLOTS)
+            if self._cycler is not None:
+                try:
+                    _slots = list(self._cycler.slots)
+                except Exception:
+                    pass
+            # 백그라운드 재-lock 차단.
+            if self._cycler is not None:
+                try:
+                    self._cycler.suspend()
+                except Exception:
+                    pass
+            # 1) self-target: TAB → HOME → TAB.
+            self.log.info("[REANCHOR] 1) TAB→HOME→TAB (self-target)")
+            _press_vk(VK_TAB); time.sleep(_gap)
+            _press_vk(VK_HOME, extended=True); time.sleep(_gap)
+            _press_vk(VK_TAB); time.sleep(_gap)
+            # 2) 토글 OFF.
+            for _vk in _slots:
+                try:
+                    press_numpad_scan(_vk)
+                except Exception:
+                    pass
+            if self._cycler is not None:
+                try:
+                    self._cycler._locked.clear()
+                except Exception:
+                    pass
+            self.log.info("[REANCHOR] 2) 토글 OFF")
+            time.sleep(_gap)
+            # 3) TAB 1회 → red & white 둘 다 미검출(2프레임) 확인.
+            _press_vk(VK_TAB); time.sleep(_gap)
+            _clean = False
+            _ok = 0
+            _t_end = time.time() + 0.6
+            while time.time() < _t_end and not getattr(self, "_stop", False):
+                if (not self._cur_red_raw) and (not self._cur_white_raw):
+                    _ok += 1
+                    if _ok >= 2:
+                        _clean = True
+                        break
+                else:
+                    _ok = 0
+                time.sleep(0.05)
+            if not _clean:
+                # Q2: clean 실패 → 토글 재ON 복원 후 종료(격수 추종).
+                self.log.info(
+                    f"[REANCHOR] 3) clean 실패 (red={self._cur_red_raw} "
+                    f"white={self._cur_white_raw}) → abort, 격수 추종")
+                for _vk in _slots:
+                    try:
+                        skill_lock_vk(_vk)
+                    except Exception:
+                        pass
+                if self._cycler is not None:
+                    try:
+                        self._cycler._locked.clear()
+                        self._cycler._locked.update(_slots)
+                        self._cycler.resume()
+                    except Exception:
+                        pass
+                self._reanchor_active = False
+                return
+            # clean → 4~6은 _pending_tab_lock(dist5)에 위임. 메인루프가 일반
+            # follow로 격수 접근 → dist≤5 시 TAB×2+토글재ON+resume+_reanchor 해제.
+            self.log.info(
+                "[REANCHOR] 3) clean OK → 접근(dist≤5) 후 TAB×2 재고정 위임")
+            self._pending_tab_lock_dist = 5
+            self._pending_tab_lock_until = time.time() + 20.0
+        except Exception as _e:
+            self.log.warning(f"[REANCHOR] 시퀀스 예외: {_e}")
+            try:
+                if self._cycler is not None:
+                    self._cycler.resume()
+            except Exception:
+                pass
+            self._reanchor_active = False
 
     def stop(self):
         self._stop = True
@@ -1055,7 +1177,12 @@ class HealerWorker(QtCore.QThread):
             # 완료할 때까지 scheduler 시전 유예. Shift+Z 시퀀스와 NumPad scan
             # 이 같은 ms 에 병렬 실행되어 봉황 토글 꼬이는 문제 해결.
             try:
-                sched.set_ready_gate(cycler.is_initial_lock_done)
+                # 재고정 시퀀스 진행 중엔 스케줄러 시전 유예(자힐/부활 정지).
+                # 시퀀스 끝난 뒤 죽어있으면 그때 자부(자힐/부활) 정상 발동(Q3).
+                _orig_ready_gate = cycler.is_initial_lock_done
+                sched.set_ready_gate(
+                    lambda: _orig_ready_gate()
+                    and not _worker_self._reanchor_active)
             except Exception as _e:
                 self.log.warning(f"[SKILL] ready_gate 연결 실패: {_e}")
             sched.start()
@@ -1518,6 +1645,43 @@ class HealerWorker(QtCore.QThread):
                 # 자힐 종료 시 저장 타겟 해제 (다음 자힐 진입에 새로 저장).
                 elif not _locked_now and self._seq_rclick_target is not None:
                     self._seq_rclick_target = None
+                # ── 격수 빨탭 재고정 시퀀스 트리거 (2026-06-12) ──────────────
+                # 격수 F1(atk.reanchor_seq 증가) → 조건 무시 즉시. 자동 → 같은맵 +
+                # 힐러 HP 100% 3초+ + 빨탭검출 + 60초 간격. 시퀀스는 별도 스레드.
+                _rseq = int(getattr(atk, "reanchor_seq", 0) or 0)
+                _manual_req = (_rseq != self._last_reanchor_seq)
+                self._last_reanchor_seq = _rseq  # 항상 소비(중복발동 방지).
+                try:
+                    _hp_pct_now = int(getattr(self._hpmp.latest(), "hp", -1))
+                except Exception:
+                    _hp_pct_now = -1
+                if _hp_pct_now >= 100:
+                    if self._hp100_since <= 0.0:
+                        self._hp100_since = now_sec
+                else:
+                    self._hp100_since = 0.0
+                if (not self.follow_only and not self._reanchor_active
+                        and not fol._tab_confirm_active
+                        and self._pending_tab_lock_until <= now_sec):
+                    _same_map = (bool(self.healer_map) and bool(atk.map_name)
+                                 and self.healer_map == atk.map_name)
+                    _hp_ok = (self._hp100_since > 0.0 and now_sec
+                              - self._hp100_since >= self._reanchor_hp_hold_s)
+                    _interval_ok = (now_sec - self._reanchor_last_ts
+                                    >= self._reanchor_interval_s)
+                    _auto = (_same_map and _hp_ok and bool(self._cur_red_raw)
+                             and _interval_ok)
+                    if _manual_req or _auto:
+                        self._reanchor_last_ts = now_sec
+                        self._hp100_since = 0.0
+                        self.log.info(
+                            f"[REANCHOR] 트리거 "
+                            f"({'F1수동' if _manual_req else '자동'}) "
+                            f"h_map={self.healer_map!r} a_map={atk.map_name!r} "
+                            f"hp={_hp_pct_now} red={self._cur_red_raw} "
+                            f"same_map={_same_map}"
+                        )
+                        self._start_reanchor_sequence()
                 # 2026-04-24 pending TAB-LOCK 시퀀스:
                 # SEQ-B가 ESC만 하고 끝낸 상태 (토글 OFF + cycler suspended).
                 # 조건 일괄 확인 후 묶음 시전:
@@ -1530,7 +1694,7 @@ class HealerWorker(QtCore.QThread):
                 #   - 맵 변경 후 0.5s 안정화
                 # red_raw 기반 트리거는 불가 (self-target이면 self 머리 위
                 # 빨탭 뜸, YOLO로 구분 불가). 위치 기반이 유일하게 신뢰 가능.
-                _TAB_LOCK_DIST_THR = 10
+                _TAB_LOCK_DIST_THR = int(self._pending_tab_lock_dist)
                 if (now_sec < self._pending_tab_lock_until
                         and bool(self.healer_map) and bool(atk.map_name)
                         and self.healer_map == atk.map_name
@@ -1586,11 +1750,49 @@ class HealerWorker(QtCore.QThread):
                                 f"[TAB-LOCK] TAB×2 + 토글 재ON + cycler "
                                 f"resume 완료 h_map={self.healer_map!r} "
                                 f"h={self.healer_coord} a=({_ax},{_ay}) "
-                                f"dist={_dist}"
+                                f"dist={_dist} reanchor={self._reanchor_active}"
                             )
                         except Exception as _te:
                             self.log.warning(f"[TAB-LOCK] 실패: {_te}")
                         self._pending_tab_lock_until = 0.0
+                        self._pending_tab_lock_dist = 10  # 기본값 복원.
+                        if self._reanchor_active:
+                            self._reanchor_active = False
+                            self.log.info("[REANCHOR] 완료 (TAB-LOCK 발동)")
+                # 재고정 안전망: 접근 못 해 창(20s) 만료됐는데 아직 진행중이면
+                # cycler/토글 영구 suspend 방지 — 강제 resume + 재ON + 해제.
+                elif (self._reanchor_active
+                      and self._pending_tab_lock_until > 0.0
+                      and now_sec >= self._pending_tab_lock_until):
+                    try:
+                        from ..input.target_sequence import DEFAULT_SLOTS
+                        from ..input.numlock_cycle import skill_lock_vk
+                        _slots = list(DEFAULT_SLOTS)
+                        if self._cycler is not None:
+                            try:
+                                _slots = list(self._cycler.slots)
+                            except Exception:
+                                pass
+                        for _vk in _slots:
+                            try:
+                                skill_lock_vk(_vk)
+                            except Exception:
+                                pass
+                        if self._cycler is not None:
+                            try:
+                                self._cycler._locked.clear()
+                                self._cycler._locked.update(_slots)
+                                self._cycler.resume()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    self._pending_tab_lock_until = 0.0
+                    self._pending_tab_lock_dist = 10
+                    self._reanchor_active = False
+                    self.log.info(
+                        "[REANCHOR] 창 만료 — 접근 실패, 토글 재ON 강제 복원 후 종료"
+                    )
                 if self.healer_coord != self._last_h_coord:
                     if self._last_h_coord is None and self.healer_coord is not None:
                         self.log.info(
@@ -1933,6 +2135,7 @@ class HealerWorker(QtCore.QThread):
                                 and atk.coord_valid
                                 and arm_ok_fsm
                                 and not self.follow_only
+                                and not self._reanchor_active
                                 and not _grace):
                             self.log.info(
                                 f"[WHITETAB-ARM] confirm="

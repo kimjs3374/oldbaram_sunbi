@@ -35,6 +35,9 @@ class State:
     mp: int = -1
     map_seq: int = 0
     map_change_pending: bool = False
+    # 2026-06-12: 격수 F1 → 힐러 "빨탭 재고정 시퀀스 즉시 실행" 트리거 카운터.
+    # F1 누를 때마다 +1. 힐러는 증가분 감지 시 1회 발동(패킷손실/중복에 견고).
+    reanchor_seq: int = 0
     # 격수 HP/MP 바율 (0~100 정수 %). -1 = OCR 영역 미지정/미관측.
     # 힐러 SkillScheduler 가 격수부활(hp_pct==0) 트리거로 사용.
     hp_pct: int = -1
