@@ -1,5 +1,6 @@
 """힐러 PC 메인 컨트롤러. UDP 수신 state → 현재 FSM 상태 평가 → 입력 송신."""
 import json
+import os
 import pathlib
 import time
 from collections import deque
@@ -68,8 +69,15 @@ class Follower:
         # 격수가 맵 넘긴 순간 힐러에게 "무조건 exit_dir로 이동" 지시.
         self._force_exit_until: float = 0.0
         # 2026-06-11 수정A: 본인 빨탭 후 맵전환(전이시도) 직후 흰탭 재arm 억제 창.
+        # 수정B(2026-06-11): 빨탭 확정(note_tab_done_ok) 직후에도 동일 grace.
+        # 빨라진 YOLO가 전환 중 찰나 흰탭 1프레임 잡아 또 Tab→방금 만든 빨탭
+        # 깨는 현상(사용자 진단) 차단. env OB_POST_TAB_GRACE_MS(기본 1500) 조정.
         self._post_tab_grace_until: float = 0.0
-        self._post_tab_grace_sec: float = 1.5
+        try:
+            self._post_tab_grace_sec: float = max(
+                0.0, int(os.environ.get("OB_POST_TAB_GRACE_MS", "1500")) / 1000.0)
+        except Exception:
+            self._post_tab_grace_sec = 1.5
         self._force_exit_sec: float = 2.5
         # 2026-04-22: 격수가 포탈 살짝 담그고 돌아오는(A→B→A 왕복) 경우 힐러가
         # 무조건 따라 들어가는 문제 방지. CTRL-MAPCHG 감지 후 pend_delay 지연 뒤
@@ -1230,8 +1238,20 @@ class Follower:
         return self._tab.note_fg_mismatch(now)
 
     def note_tab_done_ok(self, now: float) -> None:
-        """(#4) done_ok 직후 post-confirm pause. TabConfirm.note_done_ok 위임."""
+        """(#4) done_ok 직후 post-confirm pause. TabConfirm.note_done_ok 위임.
+
+        수정B(2026-06-11): 빨탭 확정 직후 post_tab_grace 설정 → 빨라진 YOLO가
+        전환 중 찰나 흰탭 1프레임 잡아 재arm(또 Tab)→방금 만든 빨탭 깨는 현상
+        차단(사용자 진단: "Tab 눌러 빨탭 됐는데 흰탭 인식해 Tab 또 누름").
+        grace 동안 흰탭 arm 억제, 진짜 지속 흰탭이면 grace 후 정상 재arm.
+        """
         self._tab.note_done_ok(now)
+        self._post_tab_grace_until = now + self._post_tab_grace_sec
+        if self.log is not None:
+            self.log.info(
+                f"[POST-TAB-GRACE] 빨탭 확정 → {self._post_tab_grace_sec:.1f}s "
+                f"흰탭 재arm 억제 (찰나 플리커 재Tab 방지)"
+            )
 
     # ----- 하위 호환 property (외부에서 _tab_confirm_* 직접 접근 허용) -----
     @property

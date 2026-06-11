@@ -2,7 +2,7 @@ capture:
   monitor_index: 1
   fps_target: 60
 vision:
-  imgsz: 416
+  imgsz: 608   # 사용자 요청 600 → 32 배수 보정(608). best.onnx 입력 dynamic이라 재export 불필요. 흰/빨 분류 정확도↑(저해상도 뭉개짐 완화)
   conf: 0.25
   half: true
   device: -1   # ONNX CPU 강제 (GPU 경합 spike 회피)
