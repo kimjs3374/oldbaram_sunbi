@@ -75,6 +75,7 @@ class MapOcrWorker:
         self.interval_s = max(0.1, float(interval_s))
 
         self._rec = None
+        self._crnn = None  # 맵 CRNN (PaddleOCR 대체, 학습된 게임폰트)
         self._init_note: str = ""
 
         self._lock = threading.Lock()
@@ -122,6 +123,18 @@ class MapOcrWorker:
     # 지연 초기화
     # -----------------------------------------------------------------
     def _ensure_rec(self) -> None:
+        # 맵 CRNN 로드 (PaddleOCR 대체). 있으면 _one_cycle 에서 우선 사용.
+        if self._crnn is None:
+            try:
+                from .map_crnn import MapCrnn
+                import pathlib
+                d = pathlib.Path(__file__).resolve().parent
+                c = MapCrnn(d / "map_crnn.onnx", d / "map_crnn_charset.txt")
+                self._crnn = c if c.ready() else None
+                if self._crnn is not None:
+                    self._init_note = "map_crnn.onnx (CRNN)"
+            except Exception:
+                self._crnn = None
         if self._rec is not None:
             return
         try:
@@ -179,7 +192,8 @@ class MapOcrWorker:
                 break
 
     def _one_cycle(self) -> None:
-        if self._rec is None:
+        crnn_ok = self._crnn is not None and self._crnn.ready()
+        if self._rec is None and not crnn_ok:
             return
         with self._lock:
             frame = self._latest_frame
@@ -194,13 +208,20 @@ class MapOcrWorker:
         crop, crop_h, crop_scale = self._crop_map(frame)
         if crop is None or crop.size == 0:
             return
-        try:
-            preds = self._rec.predict(crop)
-            texts = self._extract_texts(preds)
-        except Exception:
-            return
+        raw = ""
+        # CRNN 우선 (게임폰트 학습, 한글+숫자 정확). 빈값이면 PaddleOCR fallback.
+        if crnn_ok:
+            try:
+                raw = self._crnn.predict(crop) or ""
+            except Exception:
+                raw = ""
+        if not raw and self._rec is not None:
+            try:
+                preds = self._rec.predict(crop)
+                raw = " ".join(self._extract_texts(preds))
+            except Exception:
+                raw = ""
         cycle_ms = (time.perf_counter() - t_start) * 1000
-        raw = " ".join(texts) if texts else ""
 
         with self._lock:
             self._last_read = MapOcrReading(

@@ -372,6 +372,14 @@ class Ocr:
             self.digit.readtext(np.zeros((60, 400, 3), dtype=np.uint8),
                                 allowlist="0123456789 ", detail=0)
         list(self.map.predict(np.zeros((48, 320, 3), dtype=np.uint8)))
+        # 맵 CRNN (PaddleOCR 대체, 게임폰트 학습). 있으면 sync 경로에서 우선.
+        try:
+            from .map_crnn import MapCrnn
+            _cd = pathlib.Path(__file__).resolve().parent
+            _c = MapCrnn(_cd / "map_crnn.onnx", _cd / "map_crnn_charset.txt")
+            self.map_crnn = _c if _c.ready() else None
+        except Exception:
+            self.map_crnn = None
         # 맵 OCR 비동기 워커 (선택). attach_map_worker 로 붙이면 read() 의
         # 맵 블록이 비블로킹으로 전환 (메인 루프에서 PaddleOCR predict 를
         # 호출하지 않음). sync fallback 은 _async_map is None 일 때 유지.
@@ -958,9 +966,17 @@ class Ocr:
                 _prof_map_hit = True
                 _prof_t_m0 = time.perf_counter()
                 mc = self._crop_map(frame)
-                mt_list = self._extract_texts(self.map.predict(mc))
+                # CRNN 우선 (게임폰트 학습). 빈값이면 PaddleOCR fallback.
+                _raw = ""
+                if getattr(self, "map_crnn", None) is not None:
+                    try:
+                        _raw = self.map_crnn.predict(mc) or ""
+                    except Exception:
+                        _raw = ""
+                if not _raw:
+                    _raw = " ".join(self._extract_texts(self.map.predict(mc)))
                 _prof_map_ms = (time.perf_counter() - _prof_t_m0) * 1000
-                raw_m = _clean_map_text(" ".join(mt_list))
+                raw_m = _clean_map_text(_raw)
                 self._last_raw_map = raw_m
                 self._last_map_t = now
             else:
