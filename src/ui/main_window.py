@@ -313,15 +313,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self._status_strip = StatusStrip(self)
         root.addWidget(self._status_strip)
 
-        # 역할 라디오.
+        # 역할 라디오. 쩔캐(2026-06-12)는 내부 role="healer" + jjeol 플래그
+        # (HealerWorker/네트워크 경로 전부 재사용, GUI 레이아웃만 분리).
         role_row = QtWidgets.QHBoxLayout()
         self.rb_healer = QtWidgets.QRadioButton("도사")
         self.rb_attacker = QtWidgets.QRadioButton("격수")
+        self.rb_jjeol = QtWidgets.QRadioButton("쩔캐")
+        self.rb_jjeol.setToolTip(
+            "격수추종 전용 경량 모드. 현인 체크 시 격수 F2 신호로 "
+            "지폭지술 시퀀스(공력증강→지폭지술)."
+        )
         self.rb_healer.setChecked(True)
         self.rb_healer.toggled.connect(self._on_role_change)
+        self.rb_jjeol.toggled.connect(self._on_role_change)
         role_row.addWidget(QtWidgets.QLabel("역할:"))
         role_row.addWidget(self.rb_healer)
         role_row.addWidget(self.rb_attacker)
+        role_row.addWidget(self.rb_jjeol)
         # 격수 서브클래스 (도적/전사) — 격수 라디오 옆에.
         self.subclass_container = QtWidgets.QWidget()
         sc_lay = QtWidgets.QHBoxLayout(self.subclass_container)
@@ -401,6 +409,59 @@ class MainWindow(QtWidgets.QMainWindow):
         run_row.addWidget(self.chk_follow_only)
         run_row.addStretch(1)
         root.addLayout(run_row)
+
+        # ── 쩔캐 전용 패널 (2026-06-12) — 쩔캐 역할일 때만 표시 ──────────────
+        self.jjeol_box = QtWidgets.QGroupBox("쩔캐 설정")
+        _jj_lay = QtWidgets.QVBoxLayout(self.jjeol_box)
+        _jj_lay.setContentsMargins(6, 6, 6, 6)
+        _jj_lay.setSpacing(4)
+        self.chk_hyeonin = QtWidgets.QCheckBox("현인 (지폭지술 사용)")
+        self.chk_hyeonin.setToolTip(
+            "체크: 격수 F2 신호 시 공력증강→지폭지술 시퀀스 실행.\n"
+            "미체크: 순수 경량 따라가기만."
+        )
+        self.chk_hyeonin.stateChanged.connect(self._on_hyeonin_changed)
+        _jj_lay.addWidget(self.chk_hyeonin)
+        _jj_keys = QtWidgets.QHBoxLayout()
+        _jj_keys.setSpacing(6)
+        _jj_keys.addWidget(QtWidgets.QLabel("공력증강 NumPad"))
+        self.spin_jipok_gyoung = QtWidgets.QSpinBox()
+        self.spin_jipok_gyoung.setRange(0, 9)
+        self.spin_jipok_gyoung.setValue(3)
+        self.spin_jipok_gyoung.valueChanged.connect(self._on_jipok_keys_changed)
+        _jj_keys.addWidget(self.spin_jipok_gyoung)
+        _jj_keys.addWidget(QtWidgets.QLabel("지폭지술 NumPad"))
+        self.spin_jipok_jipok = QtWidgets.QSpinBox()
+        self.spin_jipok_jipok.setRange(0, 9)
+        self.spin_jipok_jipok.setValue(4)
+        self.spin_jipok_jipok.valueChanged.connect(self._on_jipok_keys_changed)
+        _jj_keys.addWidget(self.spin_jipok_jipok)
+        _jj_keys.addStretch(1)
+        self._jipok_keys_container = QtWidgets.QWidget()
+        self._jipok_keys_container.setLayout(_jj_keys)
+        _jj_lay.addWidget(self._jipok_keys_container)
+        _jj_maps = QtWidgets.QHBoxLayout()
+        _jj_maps.setSpacing(6)
+        _jj_maps.addWidget(QtWidgets.QLabel("지폭지술 시전 굴"))
+        self.jipok_maps_edit = QtWidgets.QLineEdit()
+        self.jipok_maps_edit.setPlaceholderText("예: 3,5 (비우면 전체 굴)")
+        self.jipok_maps_edit.textChanged.connect(self._on_jipok_maps_changed)
+        _jj_maps.addWidget(self.jipok_maps_edit, 1)
+        self._jipok_maps_container = QtWidgets.QWidget()
+        self._jipok_maps_container.setLayout(_jj_maps)
+        _jj_lay.addWidget(self._jipok_maps_container)
+        self.lbl_jjeol_hint = QtWidgets.QLabel(
+            "현인: 설정 탭에서 마력(MP) 영역 + MP 최대값 지정 필수.\n"
+            "격수 F2 = 지폭 신호 (MP<98% AND MP정량≥100 일 때만 발동)."
+        )
+        self.lbl_jjeol_hint.setStyleSheet("color:#94a3b8;font-size:11px;")
+        _jj_lay.addWidget(self.lbl_jjeol_hint)
+        # 현인 미체크 동안 키/굴 입력 비활성.
+        self._jipok_keys_container.setEnabled(False)
+        self._jipok_maps_container.setEnabled(False)
+        root.addWidget(self.jjeol_box)
+        self.jjeol_box.setVisible(False)
+        self.jjeol = False  # 쩔캐 모드 플래그 (role은 "healer" 유지).
 
         # 클라우드 패널 (설정 sync + 자동 업데이트). 미설정이면 조용히 비활성.
         try:
@@ -904,9 +965,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._append_log(s)
 
     def _on_role_change(self, _checked=False):
-        self.role = "healer" if self.rb_healer.isChecked() else "attacker"
+        # 쩔캐(rb_jjeol)는 내부적으로 healer role + jjeol 플래그.
+        # 네트워크/워커 경로는 힐러와 동일, GUI 레이아웃만 분리.
+        self.jjeol = bool(getattr(self, "rb_jjeol", None) is not None
+                          and self.rb_jjeol.isChecked())
+        self.role = "attacker" if self.rb_attacker.isChecked() else "healer"
         self._apply_role_ui()
-        self._append_log(f"역할={self.role}")
+        self._append_log(f"역할={'쩔캐' if self.jjeol else self.role}")
         if self.role == "healer":
             # 격수 heartbeat 정리 → 힐러 리스너/heartbeat 가동.
             self._stop_attacker_heartbeat()
@@ -926,20 +991,35 @@ class MainWindow(QtWidgets.QMainWindow):
     def _apply_role_ui(self):
         """창 크기는 setFixedSize로 고정. 역할에 따라 프리뷰/버튼 가시성만 토글."""
         is_healer = (self.role == "healer")
-        self.preview.setVisible(is_healer)
+        is_jjeol = bool(getattr(self, "jjeol", False)) and is_healer
+        # 쩔캐: 프리뷰 제거(경량) + 스킬 설정 불필요 + 따라가기 강제 ON.
+        self.preview.setVisible(is_healer and not is_jjeol)
         # 힐러 전용 설정은 숨겨도 되지만, 팝업이라 버튼만 남기고 그대로 둠.
         # 격수 모드에선 ARM/스킬/파라미터 버튼 비활성.
         self.chk_arm.setEnabled(is_healer)
         self.btn_pause.setEnabled(is_healer)
-        self.chk_follow_only.setEnabled(is_healer)
-        self.btn_skill_cfg.setEnabled(is_healer)
+        if is_jjeol:
+            # 격수추종이 기본 — 체크 고정 후 비활성 (해제 실수 방지).
+            try:
+                self.chk_follow_only.blockSignals(True)
+                self.chk_follow_only.setChecked(True)
+                self.chk_follow_only.blockSignals(False)
+            except Exception:
+                pass
+            self.chk_follow_only.setEnabled(False)
+        else:
+            self.chk_follow_only.setEnabled(is_healer)
+        self.btn_skill_cfg.setEnabled(is_healer and not is_jjeol)
         self.btn_param_cfg.setEnabled(is_healer)
         self.btn_net_cfg.setEnabled(not is_healer)
+        # 쩔캐 전용 패널.
+        if hasattr(self, "jjeol_box"):
+            self.jjeol_box.setVisible(is_jjeol)
         # 체력/마력/쿨/닉 영역은 도사/격수 공통으로 세팅 가능 — 항상 표시.
         self.dosa_extras.setVisible(True)
-        # 블록 A/B 테스트 — 힐러 전용 (격수는 사용 안 함).
+        # 블록 A/B 테스트 — 힐러 전용 (격수/쩔캐는 사용 안 함).
         if hasattr(self, "block_test_box"):
-            self.block_test_box.setVisible(is_healer)
+            self.block_test_box.setVisible(is_healer and not is_jjeol)
         # 격수 패널은 격수 모드일 때만.
         self.attacker_panel.setVisible(not is_healer)
         # 도적/전사 서브클래스 선택 — 격수일 때만.
@@ -981,7 +1061,8 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         if is_healer:
-            self.setWindowTitle("옛바 컨트롤 — 도사")
+            self.setWindowTitle(
+                "옛바 컨트롤 — 쩔캐" if is_jjeol else "옛바 컨트롤 — 도사")
         else:
             self.setWindowTitle("옛바 컨트롤 — 격수")
             self._refresh_healer_rows()
@@ -2563,6 +2644,34 @@ class MainWindow(QtWidgets.QMainWindow):
         lbl.style().polish(lbl)
         lbl.update()
 
+    def _on_hyeonin_changed(self, state):
+        """쩔캐 '현인' 토글. 키/굴 입력 활성화 + 워커 실시간 반영."""
+        on = (state == QtCore.Qt.Checked)
+        try:
+            self._jipok_keys_container.setEnabled(on)
+            self._jipok_maps_container.setEnabled(on)
+        except Exception:
+            pass
+        if self.worker and hasattr(self.worker, "jjeol_hyeonin"):
+            self.worker.jjeol_hyeonin = on
+        self._append_log(f"[쩔캐] 현인={'ON' if on else 'OFF'}")
+
+    def _on_jipok_keys_changed(self, *_):
+        """공력증강/지폭지술 NumPad 키 변경 → 워커 실시간 반영."""
+        if self.worker and hasattr(self.worker, "jipok_vk_gyoung"):
+            self.worker.jipok_vk_gyoung = self._numpad_vk(
+                self.spin_jipok_gyoung.value())
+            self.worker.jipok_vk_jipok = self._numpad_vk(
+                self.spin_jipok_jipok.value())
+
+    def _on_jipok_maps_changed(self, text):
+        """지폭지술 시전 굴 변경 → 워커 실시간 반영."""
+        if self.worker and hasattr(self.worker, "set_jipok_maps"):
+            try:
+                self.worker.set_jipok_maps(text)
+            except Exception:
+                pass
+
     def _on_follow_only(self, state):
         """따라가기 토글. 스킬 OFF + 경량 모드(빨탭 YOLO + cooldown/buff/hp/mp
         OCR 정지). 유지: coord/맵 OCR(이동) + 경험치 OCR + 격수 좌표 추종.
@@ -3486,13 +3595,35 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.worker.set_mp_max(int(self.mp_max_spin.value()))
         except Exception:
             pass
+        # ── 쩔캐 모드 주입 (2026-06-12) — worker.start() 전에 반영 필수 ──
+        if getattr(self, "jjeol", False):
+            self.worker.jjeol_mode = True
+            self.worker.follow_only = True       # 격수추종 기본.
+            self.worker.follow_light = True      # 경량 (YOLO/쿨/버프 OCR 정지).
+            self.worker.preview_disabled = True  # 프리뷰 미송출 (최대 경량).
+            self.worker.jjeol_hyeonin = self.chk_hyeonin.isChecked()
+            self.worker.jipok_vk_gyoung = self._numpad_vk(
+                self.spin_jipok_gyoung.value())
+            self.worker.jipok_vk_jipok = self._numpad_vk(
+                self.spin_jipok_jipok.value())
+            self.worker.set_jipok_maps(self.jipok_maps_edit.text())
+            # 스킬/NumLock 싸이클 전면 OFF (지폭 시퀀스가 직접 키 송신).
+            self.worker.skill_enabled = {n: False for n in self.skill_chks}
+            self.worker.primary_vks = []
+            self._append_log(
+                f"[쩔캐] 현인={self.worker.jjeol_hyeonin} "
+                f"공증=NumPad{self.spin_jipok_gyoung.value()} "
+                f"지폭=NumPad{self.spin_jipok_jipok.value()} "
+                f"굴={self.jipok_maps_edit.text() or '전체'}"
+            )
         self.worker.frame_ready.connect(self._on_frame)
         self.worker.log_msg.connect(self._append_log_filtered)
         self.worker.stopped.connect(self._on_stopped)
         # UI 동기화: 원격(ControlCmd) 수신 시 chk_arm 체크박스 갱신.
         self.worker.remote_control_applied.connect(self._on_remote_control)
         self.worker.start()
-        self._append_log("[healer] 시작")
+        self._append_log("[쩔캐] 시작" if getattr(self, "jjeol", False)
+                         else "[healer] 시작")
         self._append_log(f"로그 파일: {self.worker.log_path}")
         # 저장된 6개 추가 영역을 워커에 일괄 반영 (game/xp/hp/mp만 setter 존재).
         try:

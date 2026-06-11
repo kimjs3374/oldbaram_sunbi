@@ -135,6 +135,16 @@ def collect(mw) -> dict:
                          for n, sp in mw.skill_spins.items()},
         "parlyuk_offset": mw.parlyuk_spin.value(),
         "parlyuk_maps": mw.parlyuk_maps_edit.text(),
+        # 쩔캐 (2026-06-12). role은 "healer"로 저장되므로 jjeol 별도 키.
+        "jjeol": bool(getattr(mw, "jjeol", False)),
+        "jipok_hyeonin": bool(mw.chk_hyeonin.isChecked())
+            if hasattr(mw, "chk_hyeonin") else False,
+        "spin_jipok_gyoung": int(mw.spin_jipok_gyoung.value())
+            if hasattr(mw, "spin_jipok_gyoung") else 3,
+        "spin_jipok_jipok": int(mw.spin_jipok_jipok.value())
+            if hasattr(mw, "spin_jipok_jipok") else 4,
+        "jipok_maps": mw.jipok_maps_edit.text()
+            if hasattr(mw, "jipok_maps_edit") else "",
         # Window geometry
         "win_x": int(mw.x()),
         "win_y": int(mw.y()),
@@ -180,11 +190,15 @@ def load(mw):
     except Exception:
         return
     g = data.get
-    # 역할
+    # 역할 — 쩔캐는 role="healer" + jjeol=True 조합으로 저장됨.
     role = g("role", "healer")
     if role == "attacker":
         mw.rb_attacker.setChecked(True)
         mw.role = "attacker"
+    elif bool(g("jjeol", False)) and hasattr(mw, "rb_jjeol"):
+        mw.rb_jjeol.setChecked(True)
+        mw.role = "healer"
+        mw.jjeol = True
     else:
         mw.rb_healer.setChecked(True)
         mw.role = "healer"
@@ -542,6 +556,20 @@ def load(mw):
         mw.parlyuk_spin.setValue(int(g("parlyuk_offset")))
     if g("parlyuk_maps") is not None:
         mw.parlyuk_maps_edit.setText(str(g("parlyuk_maps")))
+    # 쩔캐 설정 복원 (2026-06-12).
+    try:
+        if hasattr(mw, "chk_hyeonin"):
+            mw.chk_hyeonin.setChecked(bool(g("jipok_hyeonin", False)))
+        if g("spin_jipok_gyoung") is not None and hasattr(
+                mw, "spin_jipok_gyoung"):
+            mw.spin_jipok_gyoung.setValue(int(g("spin_jipok_gyoung")))
+        if g("spin_jipok_jipok") is not None and hasattr(
+                mw, "spin_jipok_jipok"):
+            mw.spin_jipok_jipok.setValue(int(g("spin_jipok_jipok")))
+        if g("jipok_maps") is not None and hasattr(mw, "jipok_maps_edit"):
+            mw.jipok_maps_edit.setText(str(g("jipok_maps")))
+    except Exception:
+        pass
     # Window geometry 복원 — 화면 밖이면 무시.
     try:
         wx = g("win_x"); wy = g("win_y")

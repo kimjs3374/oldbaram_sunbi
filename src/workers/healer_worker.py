@@ -2,6 +2,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import os
+import re
 import threading
 import time
 from datetime import datetime
@@ -107,6 +108,9 @@ class HealerWorker(QtCore.QThread):
         # frame_ready emit 주기 제한 (Hz). 0이면 매 프레임.
         self.preview_hz_limit = 0.0
         self._last_preview_emit_ts = 0.0
+        # 2026-06-12 쩔캐 경량: True 면 frame_ready 에 preview_frame 미포함
+        # (상태값만 5Hz emit — GUI paint/마샬링 비용 제거).
+        self.preview_disabled = False
         # OCR poll 주기 (cooldown/xp). 런타임 치환: XpOcr.poll_sec, CooldownOcr.poll_sec.
         # 0이면 기본 유지.
         self.ocr_poll_sec = 0.0
@@ -250,6 +254,22 @@ class HealerWorker(QtCore.QThread):
                 1, int(os.environ.get("OB_REANCHOR_DIST", "10")))
         except Exception:
             self._reanchor_dist = 10
+        # ── 쩔캐 모드 (2026-06-12) ──────────────────────────────────────────
+        # jjeol_mode=True: 격수추종 전용(follow_only/follow_light 병행 가정).
+        # jjeol_hyeonin=True(현인): 격수 F2(State.jipok_seq 증가) 신호 수신 시
+        # 지폭지술 시퀀스 — 굴 게이트 + MP<98% + MP정량>=100 확인 →
+        # 공력증강(burst, MP 90% 도달까지 재시도) → 지폭지술 1회 → 추종 복귀.
+        # 조건 불충족이면 무시+로그(상태 꼬임 방지, 격수 재신호로 재시도).
+        self.jjeol_mode: bool = False
+        self.jjeol_hyeonin: bool = False
+        self.jipok_vk_gyoung: int = 0x63   # 공력증강 NumPad VK (GUI 주입).
+        self.jipok_vk_jipok: int = 0x64    # 지폭지술 NumPad VK (GUI 주입).
+        self._jipok_maps: set = set()      # 시전 굴 (비면 전체 허용).
+        self._last_jipok_seq: int = 0      # 격수 F2 카운터 마지막 관측값.
+        self._jipok_active: bool = False   # 시퀀스 진행 중.
+        self._jipok_hold_move: bool = False  # 시퀀스 중 방향키 중단.
+        self._jipok_mp_done_pct: int = 90  # 공력증강 완료 판정 MP%.
+        self._jipok_timeout_s: float = 15.0  # 공증 재시도 한도.
         # 2026-04-24 자힐 중 빨탭 우클릭으로 격수 거리 좁히기. 0.5s 간격 throttle.
         self._seq_rclick_last_ts: float = 0.0
         # _hook_block_ab 진입 시점에 잡은 YOLO 빨탭 절대 화면 좌표. 자힐
@@ -535,6 +555,14 @@ class HealerWorker(QtCore.QThread):
         if c == "ping":
             return
         if c in ("follow_on", "follow_off"):
+            # 쩔캐는 격수추종이 기본 — 원격 follow_off 로 전투모드 진입 금지.
+            if getattr(self, "jjeol_mode", False) and c == "follow_off":
+                try:
+                    self.log.info(
+                        "[CTRL-RECV] cmd=follow_off — 쩔캐 모드 → 무시")
+                except Exception:
+                    pass
+                return
             self.follow_only = (c == "follow_on")
             try:
                 self.log.info(
@@ -585,6 +613,11 @@ class HealerWorker(QtCore.QThread):
             return "일시정지"
         # map_change_pending 은 격수 State 수신값을 별도 보관하지 않음.
         # 힐러 쪽은 fsm/controller 내부 flag 참조 — 간단히 follow_only 우선.
+        if bool(getattr(self, "jjeol_mode", False)):
+            if bool(getattr(self, "_jipok_active", False)):
+                return "지폭지술중"
+            return "쩔캐(현인)" if getattr(self, "jjeol_hyeonin", False) \
+                else "쩔캐"
         if bool(getattr(self, "follow_only", False)):
             return "따라가기만"
         return "전투중"
@@ -696,6 +729,226 @@ class HealerWorker(QtCore.QThread):
                     self._cycler.resume()
             except Exception:
                 pass
+            self._reanchor_hold_move = False
+            self._reanchor_active = False
+
+    # ── 쩔캐 지폭지술 (2026-06-12) ──────────────────────────────────────────
+
+    def set_jipok_maps(self, text) -> None:
+        """지폭지술 시전 굴 설정. '3,5' → {3,5}. 파력무참 굴 게이트와 동일 파서.
+
+        빈 문자열/None → set() (전체 굴 허용). 맵명 끝 '(N)' 의 N 과 대조.
+        """
+        s = set()
+        for tok in str(text or "").replace(" ", "").split(","):
+            if tok.isdigit():
+                s.add(int(tok))
+        self._jipok_maps = s
+        self.log.info(f"[JIPOK-MAPS] 시전 굴 설정 → {sorted(s) or '전체'}")
+
+    def _jipok_map_ok(self) -> bool:
+        """현재 힐러 맵이 지폭지술 허용 굴인지. maps 비면 전체 허용."""
+        if not self._jipok_maps:
+            return True
+        m = str(getattr(self, "healer_map", "") or "")
+        mt = re.search(r"\((\d+)\)\s*$", m)
+        if mt is None:
+            return False
+        try:
+            return int(mt.group(1)) in self._jipok_maps
+        except Exception:
+            return False
+
+    def _jipok_signal_check(self):
+        """F2 신호 수신 시 발동 조건 평가. (ok, reason) 반환.
+
+        조건: 현인 + 미진행 + armed + 굴 게이트 + MP<98% + MP정량>=100.
+        불충족이면 무시(상태 꼬임 방지) — 격수가 F2 재신호로 재시도.
+        """
+        if not self.jjeol_hyeonin:
+            return False, "현인 아님"
+        if self._jipok_active:
+            return False, "시퀀스 진행 중"
+        if not self.armed:
+            return False, "armed=False"
+        if not self._jipok_map_ok():
+            return False, (f"지정 굴 아님 (map={self.healer_map!r} "
+                           f"허용={sorted(self._jipok_maps)})")
+        try:
+            _hm = self._hpmp.latest()
+            _mp_pct = int(getattr(_hm, "mp", -1))
+            _mp_cur = int(getattr(_hm, "mp_cur", -1))
+        except Exception:
+            _mp_pct = -1
+            _mp_cur = -1
+        if _mp_pct < 0 or _mp_cur < 0:
+            return False, (f"MP 미관측 (pct={_mp_pct} cur={_mp_cur}, "
+                           f"MP영역/최대값 설정 확인)")
+        if _mp_pct >= 98:
+            return False, f"MP {_mp_pct}%>=98% (조건1 불충족)"
+        if _mp_cur < 100:
+            return False, f"MP 정량 {_mp_cur}<100 (조건2 불충족)"
+        return True, f"map={self.healer_map!r} mp={_mp_pct}%/{_mp_cur}"
+
+    def _on_jipok_signal(self) -> None:
+        """격수 F2 신호 1회 처리: 조건 평가 → 시퀀스 시작 or 무시+로그."""
+        ok, reason = self._jipok_signal_check()
+        if not ok:
+            self.log.info(f"[JIPOK] F2 수신 — {reason} → 무시")
+            return
+        self.log.info(f"[JIPOK] 트리거(F2) {reason} → 시퀀스 시작")
+        self._start_jipok_sequence()
+
+    def _start_jipok_sequence(self) -> None:
+        """지폭지술 시퀀스 시작 (별도 스레드).
+
+        호출 전 조건(굴/MP/현인) 확인 완료 가정. 진행 중 방향키 중단
+        (_jipok_hold_move) — 종료 시 해제되어 격수 추종 자동 복귀.
+        """
+        if self._jipok_active:
+            return
+        self._jipok_active = True
+        self._jipok_hold_move = True
+        try:
+            t = threading.Thread(target=self._run_jipok_sequence,
+                                 name="jipok", daemon=True)
+            t.start()
+        except Exception as _e:
+            self._jipok_active = False
+            self._jipok_hold_move = False
+            self.log.warning(f"[JIPOK] 스레드 시작 실패: {_e}")
+
+    def _run_jipok_sequence(self) -> None:
+        """1) 공력증강 burst → MP 90%+ 확인(미만 재시도, 타임아웃 한도)
+        2) 지폭지술 1회 3) 복귀(hold 해제 → 메인루프 격수 추종)."""
+        try:
+            from ..input.numlock_cycle import press_normal_vk
+            _vk_g = int(self.jipok_vk_gyoung)
+            _vk_j = int(self.jipok_vk_jipok)
+            _done = int(self._jipok_mp_done_pct)
+            _deadline = time.time() + float(self._jipok_timeout_s)
+            _mp = -1
+            _ok = False
+            _round = 0
+            while time.time() < _deadline and not getattr(self, "_stop", False):
+                _round += 1
+                # 공력증강 burst 1s @0.1s (스케줄러 공증과 동일 패턴).
+                self.log.info(
+                    f"[JIPOK] 1) 공력증강 burst #{_round} vk={hex(_vk_g)}")
+                _t_end = time.time() + 1.0
+                while time.time() < _t_end and not getattr(self, "_stop", False):
+                    press_normal_vk(_vk_g)
+                    time.sleep(0.1)
+                # MP OCR 반영 대기 (HpMpReader poll 0.5s).
+                time.sleep(0.7)
+                try:
+                    _mp = int(getattr(self._hpmp.latest(), "mp", -1))
+                except Exception:
+                    _mp = -1
+                self.log.info(f"[JIPOK]    공력증강 후 MP={_mp}%")
+                if _mp >= _done:
+                    _ok = True
+                    break
+            if not _ok:
+                self.log.warning(
+                    f"[JIPOK] MP {_done}% 미달(MP={_mp}%, timeout) → "
+                    f"지폭지술 생략, 격수 추종 복귀")
+                return
+            # 2) 지폭지술 1회.
+            press_normal_vk(_vk_j)
+            self.log.info(f"[JIPOK] 2) 지폭지술 시전 vk={hex(_vk_j)} → 추종 복귀")
+            time.sleep(0.3)
+        except Exception as _e:
+            self.log.warning(f"[JIPOK] 시퀀스 예외: {_e}")
+        finally:
+            # 3) 격수추종 복귀 — hold 해제로 메인루프 follow 재개.
+            self._jipok_hold_move = False
+            self._jipok_active = False
+
+    def _run_reanchor_relock(self) -> None:
+        """재고정 5~6단계 (검증형, 별도 스레드, 2026-06-12).
+
+        5) TAB 1회 → 흰탭 검출 대기(검출 시 방향키 차단 유지) →
+           TAB 1회 → 빨탭 검출 확인 → 6) 토글 ON + cycler resume.
+        빨탭 확인 실패 시 abort(토글 재ON 복원) → 다음 트리거 재시도.
+        진행 내내 _reanchor_hold_move=True (재타겟 중 캐릭 정지).
+        """
+        _gap = 0.1
+        _white_ok = False
+        _red_ok = False
+        try:
+            from ..input.target_sequence import _press_vk, VK_TAB, DEFAULT_SLOTS
+            from ..input.numlock_cycle import skill_lock_vk
+            _slots = list(DEFAULT_SLOTS)
+            if self._cycler is not None:
+                try:
+                    _slots = list(self._cycler.slots)
+                except Exception:
+                    pass
+            # 5a) 1차 TAB → 흰탭 검출 대기 (흰탭 뜨면 방향키 차단 유지).
+            _press_vk(VK_TAB)
+            time.sleep(_gap)
+            _t_end = time.time() + 0.6
+            while time.time() < _t_end and not getattr(self, "_stop", False):
+                if self._cur_white_raw:
+                    self._reanchor_hold_move = True
+                    _white_ok = True
+                    break
+                time.sleep(0.05)
+            self.log.info(f"[REANCHOR] 5) 1차 TAB → 흰탭={_white_ok}")
+            # 5b) 2차 TAB → 빨탭 검출 확인 (red & !white 2프레임).
+            _press_vk(VK_TAB)
+            time.sleep(_gap)
+            _ok = 0
+            _t_end = time.time() + 0.6
+            while time.time() < _t_end and not getattr(self, "_stop", False):
+                if self._cur_red_raw and not self._cur_white_raw:
+                    _ok += 1
+                    if _ok >= 2:
+                        _red_ok = True
+                        break
+                else:
+                    _ok = 0
+                time.sleep(0.05)
+            self.log.info(f"[REANCHOR] 5) 2차 TAB → 빨탭={_red_ok}")
+            if not _red_ok:
+                # 재타겟 실패 → 토글 재ON 복원 후 종료(다음 트리거/F1 재시도).
+                self.log.info("[REANCHOR] 빨탭 확인 실패 → abort, 토글 재ON 복원")
+                for _vk in _slots:
+                    try:
+                        skill_lock_vk(_vk)
+                    except Exception:
+                        pass
+                if self._cycler is not None:
+                    try:
+                        self._cycler._locked.clear()
+                        self._cycler._locked.update(_slots)
+                        self._cycler.resume()
+                    except Exception:
+                        pass
+                return
+            # 6) 토글 ON + cycler resume.
+            for _vk in _slots:
+                try:
+                    skill_lock_vk(_vk)
+                except Exception:
+                    pass
+            if self._cycler is not None:
+                try:
+                    self._cycler._locked.clear()
+                    self._cycler._locked.update(_slots)
+                    self._cycler.resume()
+                except Exception:
+                    pass
+            self.log.info("[REANCHOR] 6) 토글 ON → 완료")
+        except Exception as _e:
+            self.log.warning(f"[REANCHOR] relock 예외: {_e}")
+            try:
+                if self._cycler is not None:
+                    self._cycler.resume()
+            except Exception:
+                pass
+        finally:
             self._reanchor_hold_move = False
             self._reanchor_active = False
 
@@ -1696,6 +1949,13 @@ class HealerWorker(QtCore.QThread):
                             f"same_map={_same_map}"
                         )
                         self._start_reanchor_sequence()
+                # ── 쩔캐 지폭지술 트리거 (2026-06-12): 격수 F2 수동 신호 전용 ──
+                # 조건(굴/MP) 불충족 시 무시+로그 → 격수가 재신호로 재시도.
+                _jseq = int(getattr(atk, "jipok_seq", 0) or 0)
+                _jreq = (_jseq != self._last_jipok_seq)
+                self._last_jipok_seq = _jseq  # 항상 소비(중복발동 방지).
+                if _jreq and self.jjeol_mode:
+                    self._on_jipok_signal()
                 # 2026-04-24 pending TAB-LOCK 시퀀스:
                 # SEQ-B가 ESC만 하고 끝낸 상태 (토글 OFF + cycler suspended).
                 # 조건 일괄 확인 후 묶음 시전:
@@ -1719,60 +1979,66 @@ class HealerWorker(QtCore.QThread):
                     _dist = abs(_hx - _ax) + abs(_hy - _ay)
                     if now_sec - self._last_map_change_ts >= 0.5 \
                             and _dist <= _TAB_LOCK_DIST_THR:
-                        try:
-                            from ..input.target_sequence import (
-                                _press_vk, VK_TAB, DEFAULT_SLOTS
-                            )
-                            from ..input.numlock_cycle import skill_lock_vk
-                            # (1) TAB → TAB
-                            _press_vk(VK_TAB)
-                            time.sleep(0.1)
-                            _press_vk(VK_TAB)
-                            time.sleep(0.1)
-                            # (2) 토글 재ON: cycler slots 또는 DEFAULT
-                            _slots = list(DEFAULT_SLOTS)
-                            if self._cycler is not None:
-                                try:
-                                    _slots = list(self._cycler.slots)
-                                except Exception:
-                                    pass
-                            for _vk in _slots:
-                                try:
-                                    skill_lock_vk(_vk)
-                                    self.log.info(
-                                        f"[TAB-LOCK]   relock vk={hex(_vk)}"
-                                    )
-                                except Exception as _le:
-                                    self.log.warning(
-                                        f"[TAB-LOCK] relock 예외 vk={hex(_vk)}: {_le}"
-                                    )
-                            if self._cycler is not None:
-                                try:
-                                    self._cycler._locked.clear()
-                                    self._cycler._locked.update(_slots)
-                                except Exception:
-                                    pass
-                            # (3) cycler resume
-                            if self._cycler is not None:
-                                try:
-                                    self._cycler.resume()
-                                except Exception as _ce:
-                                    self.log.warning(
-                                        f"[TAB-LOCK] cycler resume 예외: {_ce}"
-                                    )
-                            self.log.info(
-                                f"[TAB-LOCK] TAB×2 + 토글 재ON + cycler "
-                                f"resume 완료 h_map={self.healer_map!r} "
-                                f"h={self.healer_coord} a=({_ax},{_ay}) "
-                                f"dist={_dist} reanchor={self._reanchor_active}"
-                            )
-                        except Exception as _te:
-                            self.log.warning(f"[TAB-LOCK] 실패: {_te}")
-                        self._pending_tab_lock_until = 0.0
-                        self._pending_tab_lock_dist = 10  # 기본값 복원.
                         if self._reanchor_active:
-                            self._reanchor_active = False
-                            self.log.info("[REANCHOR] 완료 (TAB-LOCK 발동)")
+                            # 재고정 경로(2026-06-12): 검증형 5~6단계 스레드.
+                            #   5) TAB→흰탭확인(흰탭뜨면 방향키차단)→TAB→빨탭확인 6)토글ON
+                            # main loop이 _cur_white/red_raw 갱신해야 하므로 스레드.
+                            self._reanchor_hold_move = True  # 재타겟 중 방향키 차단.
+                            self._pending_tab_lock_until = 0.0
+                            self._pending_tab_lock_dist = 10
+                            self.log.info(
+                                f"[REANCHOR] 4) 접근 완료 (dist={_dist}) → "
+                                f"5) 검증형 재타겟 시작")
+                            try:
+                                _rt = threading.Thread(
+                                    target=self._run_reanchor_relock,
+                                    name="reanchor-relock", daemon=True)
+                                _rt.start()
+                            except Exception as _re:
+                                self._reanchor_hold_move = False
+                                self._reanchor_active = False
+                                self.log.warning(
+                                    f"[REANCHOR] relock 스레드 실패: {_re}")
+                        else:
+                            # 레거시 자힐복귀 경로: 기존 인라인 TAB×2 (검증 없음).
+                            try:
+                                from ..input.target_sequence import (
+                                    _press_vk, VK_TAB, DEFAULT_SLOTS
+                                )
+                                from ..input.numlock_cycle import skill_lock_vk
+                                _press_vk(VK_TAB)
+                                time.sleep(0.1)
+                                _press_vk(VK_TAB)
+                                time.sleep(0.1)
+                                _slots = list(DEFAULT_SLOTS)
+                                if self._cycler is not None:
+                                    try:
+                                        _slots = list(self._cycler.slots)
+                                    except Exception:
+                                        pass
+                                for _vk in _slots:
+                                    try:
+                                        skill_lock_vk(_vk)
+                                    except Exception as _le:
+                                        self.log.warning(
+                                            f"[TAB-LOCK] relock 예외 vk="
+                                            f"{hex(_vk)}: {_le}")
+                                if self._cycler is not None:
+                                    try:
+                                        self._cycler._locked.clear()
+                                        self._cycler._locked.update(_slots)
+                                        self._cycler.resume()
+                                    except Exception:
+                                        pass
+                                self.log.info(
+                                    f"[TAB-LOCK] TAB×2 + 토글 재ON + resume "
+                                    f"완료 h_map={self.healer_map!r} "
+                                    f"h={self.healer_coord} a=({_ax},{_ay}) "
+                                    f"dist={_dist}")
+                            except Exception as _te:
+                                self.log.warning(f"[TAB-LOCK] 실패: {_te}")
+                            self._pending_tab_lock_until = 0.0
+                            self._pending_tab_lock_dist = 10
                 # 재고정 안전망: 접근 못 해 창(20s) 만료됐는데 아직 진행중이면
                 # cycler/토글 영구 suspend 방지 — 강제 resume + 재ON + 해제.
                 elif (self._reanchor_active
@@ -2418,7 +2684,9 @@ class HealerWorker(QtCore.QThread):
                             except Exception:
                                 pass
                         # HP/MP 픽셀 리더 — 따라가기 경량: 정지 (자힐/공증 미사용).
-                        if not self.follow_light:
+                        # 단 쩔캐(현인)는 지폭지술 MP 조건 판정에 필요 → 유지.
+                        if (not self.follow_light
+                                or (self.jjeol_mode and self.jjeol_hyeonin)):
                             try:
                                 self._hpmp.read(frame, origin)
                             except Exception:
@@ -2575,11 +2843,15 @@ class HealerWorker(QtCore.QThread):
                 # ≈6MB ndarray) 가 들어가 UI thread marshalling 이 메인 루프
                 # 대기시킴. 강제 throttle 10Hz 하한 + frame 제거.
                 _emit_now = True
+                _pv_off = bool(getattr(self, "preview_disabled", False))
                 try:
                     hz_lim = float(self.preview_hz_limit or 0.0)
                     # 미설정 시 기본 30Hz (사용자 지시 2026-04-22).
                     if hz_lim <= 0.1:
                         hz_lim = 30.0
+                    # 쩔캐 경량: 프리뷰 미송출 → 상태 emit 5Hz 면 충분.
+                    if _pv_off:
+                        hz_lim = min(hz_lim, 5.0)
                     _min_dt = 1.0 / hz_lim
                     _t_now = time.monotonic()
                     if (_t_now - self._last_preview_emit_ts) < _min_dt:
@@ -2594,7 +2866,8 @@ class HealerWorker(QtCore.QThread):
 
                 self.frame_ready.emit({
                     # frame(원본 1920x1080) 제거 — preview_frame(crop) 만으로 충분.
-                    "preview_frame": crop_frame,
+                    # 쩔캐 경량(preview_disabled): ndarray 마샬링 비용 제거.
+                    "preview_frame": (None if _pv_off else crop_frame),
                     "preview_offset": (gx_off, gy_off),
                     "det": det,
                     "all_dets": all_dets,
@@ -2749,6 +3022,9 @@ class HealerWorker(QtCore.QThread):
         # _reanchor_hold_move=False 로 풀려 정상 follow 이동.
         if self._reanchor_hold_move:
             return "-", "REANCHOR-HOLD 방향키 중단 (self-target 중)"
+        # 쩔캐 지폭지술 시퀀스 중 방향키 중단 (종료 시 해제 → 추종 복귀).
+        if self._jipok_hold_move:
+            return "-", "JIPOK-HOLD 방향키 중단 (지폭지술 시퀀스 중)"
         want, reason = self._decide_move_raw(atk, fol, map_neq)
         return self._apply_stuck_filter(want, reason, atk, fol, map_neq)
 

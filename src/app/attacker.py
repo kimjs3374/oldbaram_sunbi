@@ -23,6 +23,7 @@ from .hunt_analytics import HuntAnalytics
 try:
     import win32api
     _VK_F1 = 0x70
+    _VK_F2 = 0x71
     _HAVE_WIN32 = True
 except Exception:
     _HAVE_WIN32 = False
@@ -98,10 +99,14 @@ class Attacker:
         # 격수가 F1 누르면 힐러에게 "격수 빨탭 재고정 시퀀스 즉시 실행" 트리거.
         # 카운터 증가분을 State.reanchor_seq 로 송신 → 힐러가 증가 감지 시 1회 발동.
         self._reanchor_seq = 0
+        # F2 (2026-06-12): 쩔캐(현인) 지폭지술 트리거. 몹이 충분히 모이면 격수가
+        # F2 → State.jipok_seq 증가 송신 → 쩔캐가 증가 감지 시 지폭지술 시퀀스.
+        self._jipok_seq = 0
         # 좌표급변(=맵전환, 워프 거의 없음) 감지 시 맵이름 OCR 갱신까지
         # map_change_pending 강제 ON → 격수 맵OCR(RapidOCR) 지연을 좌표(0.01초)로 흡수.
         self._map_chg_until = 0.0
         self._f1_prev_down = False
+        self._f2_prev_down = False
         # 격수 본인 쿨 OCR — 설정 탭에서 영역/스킬 주입 전까진 inactive.
         self.cd_ocr = CooldownOcr(poll_sec=1.0, name="atk_cd")
         self.cd_ocr.start()
@@ -467,6 +472,15 @@ class Attacker:
                         f"seq={self._reanchor_seq}"
                     )
                 self._f1_prev_down = f1_down
+                # F2 에지 감지 (2026-06-12): 쩔캐(현인) 지폭지술 트리거.
+                f2_down = bool(win32api.GetAsyncKeyState(_VK_F2) & 0x8000)
+                if f2_down and not self._f2_prev_down:
+                    self._jipok_seq += 1
+                    self.log(
+                        f"[ATK-F2] 쩔캐 지폭지술 트리거 송신 "
+                        f"seq={self._jipok_seq}"
+                    )
+                self._f2_prev_down = f2_down
             _t_now = time.time()
             pending_now = (_t_now < self._map_chg_until)
 
@@ -495,6 +509,7 @@ class Attacker:
                 map_seq=self._map_seq,
                 map_change_pending=pending_now,
                 reanchor_seq=self._reanchor_seq,
+                jipok_seq=self._jipok_seq,
                 hp_pct=_hp_pct,
                 mp_pct=_mp_pct,
             )

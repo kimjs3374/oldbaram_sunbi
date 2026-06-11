@@ -64,9 +64,11 @@ def ask_session_info():
     nick_edit = QtWidgets.QLineEdit(last.get("nick", ""))
     nick_edit.setPlaceholderText("캐릭터 닉네임")
     role_combo = QtWidgets.QComboBox()
-    role_combo.addItems(["힐러", "격수"])
+    role_combo.addItems(["힐러", "격수", "쩔캐"])
     if last.get("role") == "attacker":
         role_combo.setCurrentText("격수")
+    elif last.get("role") == "jjeol":
+        role_combo.setCurrentText("쩔캐")
     lay.addRow("닉네임", nick_edit)
     lay.addRow("역할", role_combo)
     btns = QtWidgets.QDialogButtonBox(
@@ -77,7 +79,13 @@ def ask_session_info():
     nick_edit.setFocus()
     if dlg.exec_() != QtWidgets.QDialog.Accepted:
         return None
-    role = "attacker" if role_combo.currentText() == "격수" else "healer"
+    _sel = role_combo.currentText()
+    if _sel == "격수":
+        role = "attacker"
+    elif _sel == "쩔캐":
+        role = "jjeol"
+    else:
+        role = "healer"
     nick = nick_edit.text().strip()
     _save_last(nick, role)
     return {"nick": nick, "role": role}
@@ -95,9 +103,12 @@ def main():
     logger_setup.set_session(info["nick"], info["role"])
     w = MainWindow(cfg)
     # 시작 다이얼로그에서 고른 역할로 초기화 (라디오 토글 → self.role 반영).
+    # 쩔캐는 내부 role="healer" + jjeol 플래그 (rb_jjeol 라디오).
     try:
         if info["role"] == "attacker":
             w.rb_attacker.setChecked(True)
+        elif info["role"] == "jjeol" and hasattr(w, "rb_jjeol"):
+            w.rb_jjeol.setChecked(True)
         else:
             w.rb_healer.setChecked(True)
     except Exception:
