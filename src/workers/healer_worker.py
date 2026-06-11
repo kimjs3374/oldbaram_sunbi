@@ -2773,8 +2773,9 @@ class HealerWorker(QtCore.QThread):
                 if h is not None:
                     wp = fol.next_waypoint(self.healer_map, h, tol=tol,
                                            exit_dash=False)
-                    if wp is not None:
-                        wx, wy = wp
+                    # next_waypoint 반환 형식 = ((wx,wy), dir).
+                    if wp is not None and wp[0] is not None:
+                        (wx, wy), _wd = wp
                         if abs(wx - h[0]) + abs(wy - h[1]) > tol:
                             dx, dy = wx - h[0], wy - h[1]
                             w = (("R" if dx > 0 else "L")
@@ -2782,7 +2783,7 @@ class HealerWorker(QtCore.QThread):
                                  else ("D" if dy > 0 else "U"))
                             remain = fol.force_exit_remaining()
                             return w, (
-                                f"FORCE-EXIT-TRAIL wp={wp} h={h} "
+                                f"FORCE-EXIT-TRAIL wp=({wx},{wy}) h={h} "
                                 f"remain={remain:.2f}s"
                             )
                 # trail 끝 도달 → exit_dir 밀어 맵 전환.
