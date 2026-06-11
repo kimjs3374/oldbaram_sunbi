@@ -89,6 +89,16 @@ class HealerWorker(QtCore.QThread):
         self._cur_red_cy: float = -1.0
         # 포탈 진입 로그 1회 게이트 (맵 도달 시 리셋).
         self._portal_enter_logged: bool = False
+        # 본인 빨탭(red&!white) 확정 후 exit_dir 밀기 전 settle 슬립 (2026-06-11
+        # 사용자 요구): 확정 직후 곧장 밀면 self-빨탭이 덜 박힌 채 이동→미는 중
+        # 흰탭 재출현으로 끊김(선비족4→4-3(1) 53.4~55.5 왕복 실측). 확정 후 잠깐
+        # 제자리 hold 로 빨탭 고정 시간 확보 후 진입. env OB_PORTAL_SETTLE_MS(기본 300).
+        try:
+            self._portal_settle_s = max(
+                0.0, int(os.environ.get("OB_PORTAL_SETTLE_MS", "300")) / 1000.0)
+        except Exception:
+            self._portal_settle_s = 0.3
+        self._portal_settle_until: float = 0.0
         self.yolo_every_n = 1
         # --- 저사양 모드 런타임 튠 (main_window._on_toggle_low_spec이 setattr). ---
         # 0/기본값이면 효과 없음. YoloRunner.imgsz는 런타임 값 치환 가능.
@@ -2719,6 +2729,7 @@ class HealerWorker(QtCore.QThread):
                 if hasattr(fol, "cancel_force_exit"):
                     fol.cancel_force_exit()
                 self._portal_enter_logged = False  # 새 맵 도달 → 게이트 리셋.
+                self._portal_settle_until = 0.0    # settle 창도 리셋.
                 self.log.info(
                     "[FORCE-EXIT-CANCEL] 격수와 같은 맵 도달 → 해제, 격수 추종"
                 )
@@ -2751,14 +2762,25 @@ class HealerWorker(QtCore.QThread):
                             f"(red={self._cur_red_raw} white={self._cur_white_raw})"
                         )
                     if not self._portal_enter_logged:
+                        # 첫 빨탭 확정 → settle 슬립 창 시작.
+                        self._portal_settle_until = (
+                            time.time() + self._portal_settle_s)
                         self.log.info(
                             f"[PORTAL-ENTER] 맵={self.healer_map!r} 본인 빨탭 확정 "
-                            f"→ 다음맵 진입 "
+                            f"→ settle {self._portal_settle_s*1000:.0f}ms 후 진입 "
                             f"(red={self._cur_red_raw} white={self._cur_white_raw} "
                             f"red_px=({self._cur_red_cx:.0f},{self._cur_red_cy:.0f}) "
                             f"h={h} exit={getattr(fol, '_exit_coord', None)})"
                         )
                         self._portal_enter_logged = True
+                    # settle 슬립: 확정 직후 잠깐 제자리 hold(키 release)로 self-빨탭
+                    # 이 게임에 박힐 시간 확보 후 밀기. 미는 중 흰탭 재출현 끊김 방지.
+                    _sn = time.time()
+                    if _sn < self._portal_settle_until:
+                        return "-", (
+                            f"PORTAL-SETTLE 빨탭 고정 대기 "
+                            f"remain={self._portal_settle_until - _sn:.2f}s"
+                        )
                 # 2026-06-11 사용자 명시: 포탈좌표 직행 폐기 → 격수 trail 순서대로.
                 # 직행(_exit_coord)은 격수가 우회한 벽에 박힘 (시뻑구(7) 출구
                 # (0,6) 직행 L 벽 STUCK 62회). 격수가 밟은 trail = 검증된 통로 →
