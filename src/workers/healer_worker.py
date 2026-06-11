@@ -257,7 +257,7 @@ class HealerWorker(QtCore.QThread):
         # ── 쩔캐 모드 (2026-06-12) ──────────────────────────────────────────
         # jjeol_mode=True: 격수추종 전용(follow_only/follow_light 병행 가정).
         # jjeol_hyeonin=True(현인): 격수 F2(State.jipok_seq 증가) 신호 수신 시
-        # 지폭지술 시퀀스 — 굴 게이트 + MP<98% + MP정량>=100 확인 →
+        # 지폭지술 시퀀스 — 굴 게이트 + MP정량>=100 확인(MP≥98%면 공증생략 즉시) →
         # 공력증강(burst, MP 90% 도달까지 재시도) → 지폭지술 1회 → 추종 복귀.
         # 조건 불충족이면 무시+로그(상태 꼬임 방지, 격수 재신호로 재시도).
         self.jjeol_mode: bool = False
@@ -766,8 +766,9 @@ class HealerWorker(QtCore.QThread):
     def _jipok_signal_check(self):
         """F2 신호 수신 시 발동 조건 평가. (ok, reason) 반환.
 
-        조건: 현인 + 미진행 + armed + 굴 게이트 + MP<98% + MP정량>=100.
-        불충족이면 무시(상태 꼬임 방지) — 격수가 F2 재신호로 재시도.
+        조건: 현인 + 미진행 + armed + 굴 게이트 + MP정량>=100.
+        MP≥98%(만땅)면 공증 생략하고 지폭 즉시, MP<98%면 공증으로 올린 뒤 지폭
+        (분기는 _run_jipok_sequence). 불충족이면 무시 — 격수 F2 재신호로 재시도.
         """
         if not self.jjeol_hyeonin:
             return False, "현인 아님"
@@ -788,10 +789,10 @@ class HealerWorker(QtCore.QThread):
         if _mp_pct < 0 or _mp_cur < 0:
             return False, (f"MP 미관측 (pct={_mp_pct} cur={_mp_cur}, "
                            f"MP영역/최대값 설정 확인)")
-        if _mp_pct >= 98:
-            return False, f"MP {_mp_pct}%>=98% (조건1 불충족)"
         if _mp_cur < 100:
-            return False, f"MP 정량 {_mp_cur}<100 (조건2 불충족)"
+            return False, f"MP 정량 {_mp_cur}<100 (조건 불충족)"
+        # 2026-06-12: MP≥98%(만땅)도 통과 → 시퀀스에서 공증 생략하고 지폭 즉시.
+        # MP<98%면 기존대로 공증으로 올린 뒤 지폭.
         return True, f"map={self.healer_map!r} mp={_mp_pct}%/{_mp_cur}"
 
     def _on_jipok_signal(self) -> None:
@@ -845,11 +846,19 @@ class HealerWorker(QtCore.QThread):
             _vk_g = int(self.jipok_vk_gyoung)
             _vk_j = int(self.jipok_vk_jipok)
             _done = int(self._jipok_mp_done_pct)
+            # MP 만땅(≥98%)이면 공증 생략하고 지폭 즉시 (사용자 2026-06-12).
+            try:
+                _mp = int(getattr(self._hpmp.latest(), "mp", -1))
+            except Exception:
+                _mp = -1
+            _ok = (_mp >= 98)
+            if _ok:
+                self.log.info(
+                    f"[JIPOK] MP {_mp}%≥98%(만땅) → 공증 생략, 지폭 즉시")
             _deadline = time.time() + float(self._jipok_timeout_s)
-            _mp = -1
-            _ok = False
             _round = 0
-            while time.time() < _deadline and not getattr(self, "_stop", False):
+            while (not _ok) and time.time() < _deadline \
+                    and not getattr(self, "_stop", False):
                 _round += 1
                 # 공력증강 burst 1s @0.1s (스케줄러 공증과 동일 패턴).
                 self.log.info(
