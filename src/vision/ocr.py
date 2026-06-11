@@ -372,14 +372,9 @@ class Ocr:
             self.digit.readtext(np.zeros((60, 400, 3), dtype=np.uint8),
                                 allowlist="0123456789 ", detail=0)
         list(self.map.predict(np.zeros((48, 320, 3), dtype=np.uint8)))
-        # 맵 CRNN (PaddleOCR 대체, 게임폰트 학습). 있으면 sync 경로에서 우선.
-        try:
-            from .map_crnn import MapCrnn
-            _cd = pathlib.Path(__file__).resolve().parent
-            _c = MapCrnn(_cd / "map_crnn.onnx", _cd / "map_crnn_charset.txt")
-            self.map_crnn = _c if _c.ready() else None
-        except Exception:
-            self.map_crnn = None
+        # 2026-06-11 CRNN 임시 비활성: 통째 암기(과적합)라 학습외 숫자 조합 못읽음.
+        # 숫자 char digit_cnn 재설계 전까지 PaddleOCR 사용. 영구 None.
+        self.map_crnn = None
         # 맵 OCR 비동기 워커 (선택). attach_map_worker 로 붙이면 read() 의
         # 맵 블록이 비블로킹으로 전환 (메인 루프에서 PaddleOCR predict 를
         # 호출하지 않음). sync fallback 은 _async_map is None 일 때 유지.

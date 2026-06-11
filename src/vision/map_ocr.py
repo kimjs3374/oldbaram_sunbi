@@ -123,18 +123,10 @@ class MapOcrWorker:
     # 지연 초기화
     # -----------------------------------------------------------------
     def _ensure_rec(self) -> None:
-        # 맵 CRNN 로드 (PaddleOCR 대체). 있으면 _one_cycle 에서 우선 사용.
-        if self._crnn is None:
-            try:
-                from .map_crnn import MapCrnn
-                import pathlib
-                d = pathlib.Path(__file__).resolve().parent
-                c = MapCrnn(d / "map_crnn.onnx", d / "map_crnn_charset.txt")
-                self._crnn = c if c.ready() else None
-                if self._crnn is not None:
-                    self._init_note = "map_crnn.onnx (CRNN)"
-            except Exception:
-                self._crnn = None
+        # 2026-06-11 CRNN 임시 비활성: 66종 통째 암기(과적합)라 학습에 없는
+        # 숫자 조합(x,y 바뀜)을 못 읽음. 숫자 char digit_cnn 재설계 전까지
+        # PaddleOCR fallback 사용(새 조합은 읽음). self._crnn 영구 None.
+        self._crnn = None
         if self._rec is not None:
             return
         try:
@@ -237,9 +229,11 @@ class MapOcrWorker:
                 raw = raw or ""
             except Exception:
                 raw, conf = "", 0.0
-            # 미학습/저신뢰(conf<0.5) crop 수집 — 학습된 맵은 conf 높아 skip.
-            if conf < 0.5:
-                self._save_collect(crop)
+            # 2026-06-11 진단/재학습: 실게임 worker crop 전부 수집.
+            # CRNN이 학습(ocr sync crop)과 다른 worker crop을 conf 높게 오인식
+            # ('선비족1'→'선비족' 숫자누락) → conf<0.5 안 걸려 수집 0. 학습=추론
+            # crop 일치 위해 worker crop 으로 재수집 후 재학습 필요. (throttle 1.5s)
+            self._save_collect(crop)
         if not raw and self._rec is not None:
             try:
                 preds = self._rec.predict(crop)
