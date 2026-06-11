@@ -245,6 +245,11 @@ class HealerWorker(QtCore.QThread):
         except Exception:
             self._reanchor_interval_s = 60.0
         self._reanchor_hp_hold_s: float = 3.0
+        try:
+            self._reanchor_dist: int = max(
+                1, int(os.environ.get("OB_REANCHOR_DIST", "10")))
+        except Exception:
+            self._reanchor_dist = 10
         # 2026-04-24 자힐 중 빨탭 우클릭으로 격수 거리 좁히기. 0.5s 간격 throttle.
         self._seq_rclick_last_ts: float = 0.0
         # _hook_block_ab 진입 시점에 잡은 YOLO 빨탭 절대 화면 좌표. 자힐
@@ -680,8 +685,9 @@ class HealerWorker(QtCore.QThread):
             # 접근은 이동이 필요하므로 방향키 중단 해제(4단계 진입).
             self._reanchor_hold_move = False
             self.log.info(
-                "[REANCHOR] 3) clean OK → 접근(dist≤5) 후 TAB×2 재고정 위임")
-            self._pending_tab_lock_dist = 5
+                f"[REANCHOR] 3) clean OK → 접근(dist≤{self._reanchor_dist}) "
+                f"후 TAB×2 재고정 위임")
+            self._pending_tab_lock_dist = int(self._reanchor_dist)
             self._pending_tab_lock_until = time.time() + 20.0
         except Exception as _e:
             self.log.warning(f"[REANCHOR] 시퀀스 예외: {_e}")
