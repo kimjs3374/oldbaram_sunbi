@@ -191,6 +191,27 @@ class MapOcrWorker:
             if self._stop_evt.wait(wait):
                 break
 
+    def _save_collect(self, crop) -> None:
+        """미학습/저신뢰 맵 crop 수집 (logs/map_crops/). throttle 1.5s.
+
+        학습된 맵은 conf 높아 호출 안 됨 → 새 맵/불확실만 모인다.
+        종료 시 cloud_map_upload 가 자동 업로드(main_window.closeEvent).
+        """
+        now = time.monotonic()
+        if now - getattr(self, "_last_collect_ts", 0.0) < 1.5:
+            return
+        self._last_collect_ts = now
+        try:
+            import pathlib
+            d = pathlib.Path.cwd() / "logs" / "map_crops"
+            d.mkdir(parents=True, exist_ok=True)
+            n = getattr(self, "_collect_n", 0) + 1
+            self._collect_n = n
+            fn = f"{time.strftime('%H%M%S')}_c{n:04d}.png"
+            cv2.imwrite(str(d / fn), crop)
+        except Exception:
+            pass
+
     def _one_cycle(self) -> None:
         crnn_ok = self._crnn is not None and self._crnn.ready()
         if self._rec is None and not crnn_ok:
@@ -212,9 +233,13 @@ class MapOcrWorker:
         # CRNN 우선 (게임폰트 학습, 한글+숫자 정확). 빈값이면 PaddleOCR fallback.
         if crnn_ok:
             try:
-                raw = self._crnn.predict(crop) or ""
+                raw, conf = self._crnn.predict(crop)
+                raw = raw or ""
             except Exception:
-                raw = ""
+                raw, conf = "", 0.0
+            # 미학습/저신뢰(conf<0.5) crop 수집 — 학습된 맵은 conf 높아 skip.
+            if conf < 0.5:
+                self._save_collect(crop)
         if not raw and self._rec is not None:
             try:
                 preds = self._rec.predict(crop)

@@ -674,20 +674,29 @@ class Ocr:
                     pass
         except Exception:
             pass
-        # 디버그: 매 20회 1장씩 crop 저장 (logs/map_crops/). 원인 진단용.
+        # 2026-06-11: 무차별 20프레임 저장 폐기 → CRNN conf<0.5(미학습/새맵)일
+        # 때만 _save_collect_crop 으로 수집. 학습된 맵 중복 수집 제거.
+        return c
+
+    def _save_collect_crop(self, crop) -> None:
+        """미학습/저신뢰 맵 crop 수집 (logs/map_crops/). throttle 1.5s.
+
+        학습된 맵은 CRNN conf 높아 호출 안 됨 → 새 맵/불확실만 모인다.
+        종료 시 cloud_map_upload 가 자동 업로드(main_window.closeEvent).
+        """
+        now = time.monotonic()
+        if now - getattr(self, "_last_collect_ts", 0.0) < 1.5:
+            return
+        self._last_collect_ts = now
         try:
-            self._map_dbg_n = getattr(self, "_map_dbg_n", 0) + 1
-            if self._map_dbg_n % 20 == 1:
-                dbg_dir = _PROJECT_ROOT / "logs" / "map_crops"
-                dbg_dir.mkdir(parents=True, exist_ok=True)
-                stamp = time.strftime("%H%M%S")
-                h_ = int(getattr(self, "_last_map_crop_h", 0))
-                s_ = int(getattr(self, "_last_map_crop_scale", 1))
-                fn = f"{stamp}_n{self._map_dbg_n:04d}_h{h_}_x{s_}.png"
-                cv2.imwrite(str(dbg_dir / fn), c)
+            d = _PROJECT_ROOT / "logs" / "map_crops"
+            d.mkdir(parents=True, exist_ok=True)
+            n = getattr(self, "_collect_n", 0) + 1
+            self._collect_n = n
+            fn = f"{time.strftime('%H%M%S')}_c{n:04d}.png"
+            cv2.imwrite(str(d / fn), crop)
         except Exception:
             pass
-        return c
 
     @staticmethod
     def _extract_texts(preds) -> List[str]:
@@ -970,7 +979,10 @@ class Ocr:
                 _raw = ""
                 if getattr(self, "map_crnn", None) is not None:
                     try:
-                        _raw = self.map_crnn.predict(mc) or ""
+                        _raw, _conf = self.map_crnn.predict(mc)
+                        _raw = _raw or ""
+                        if _conf < 0.5:
+                            self._save_collect_crop(mc)
                     except Exception:
                         _raw = ""
                 if not _raw:
