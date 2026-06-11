@@ -12,8 +12,8 @@
 - `test_once(frame, origin)` : 테스트 버튼용 동기 1회 OCR. 원시 텍스트/현재값/
   max/pct 를 dict 로 반환.
 
-인식: 숫자 digit_cnn(onnx) 전용 우선, 빈/실패 시 RapidOCR(rec-only) 보조.
-torch/paddle 의존 0.
+인식: 숫자 digit_cnn(onnx) **전용** (좌표/XP 와 동일 모델). fallback 없음.
+torch/paddle/rapidocr 의존 0.
 
 전처리:
 - G 채널 - max(R, B) > thr 마스크로 초록 글씨 픽셀만 추출.
@@ -148,10 +148,9 @@ class HpMpReader:
         self._mp_region: Optional[Tuple[int, int, int, int]] = None
         self._hp_max: int = 0
         self._mp_max: int = 0
-        self._rec = None
         # 숫자 CNN (2026-06-10): 좌표 digit_cnn.onnx 재사용. 실측 HP/MP 99%
         # (자릿수 손실 없음 — 자릿수 누락/삽입 오독 해결). 세그+분류.
-        # 로드 실패/빈 결과면 아래 _rec(RapidOCR rec-only) 보조.
+        # XP/좌표와 동일하게 digit_cnn **전용** (RapidOCR fallback 제거 2026-06-11).
         self._digit_cnn = None
         try:
             from .digit_cnn import DigitCnn
@@ -306,8 +305,8 @@ class HpMpReader:
             max_val = self._hp_max if kind == "hp" else self._mp_max
         base = {"ok": False, "cur": -1, "max": int(max_val), "pct": -1,
                 "raw": "", "region": region, "diag": "", "debug_path": ""}
-        if self._rec is None:
-            base["diag"] = f"rec 초기화 실패: {self._init_note}"
+        if self._digit_cnn is None or not self._digit_cnn.ready():
+            base["diag"] = f"digit_cnn 미가용: {self._init_note}"
             return base
         if region is None:
             base["diag"] = "영역 미지정"
@@ -350,14 +349,9 @@ class HpMpReader:
             except Exception as e:
                 debug_path = f"(save fail: {e})"
         base["debug_path"] = debug_path
-        try:
-            res = self._rec.predict(up)
-        except Exception as e:
-            base["diag"] = f"predict err: {e}"
-            return base
-        raw_text = self._extract_text(res)
-        base["raw"] = raw_text
-        digits = re.sub(r"[^0-9]", "", raw_text or "")
+        # digit_cnn 세그+분류 전용 (RapidOCR 제거).
+        digits = self._cnn_digits(up)
+        base["raw"] = digits
         if not digits:
             base["diag"] = "숫자 없음"
             return base
@@ -383,19 +377,12 @@ class HpMpReader:
             pass
 
     def _ensure_rec(self) -> None:
-        if self._rec is not None:
-            return
-        # 2026-04-22: shared rec 복귀 + lock 은 no-op. rec 공유는 OK,
-        # 문제는 lock 경합만이었음.
-        try:
-            from .cooldown_ocr import _get_shared_rec
-            self._rec, note = _get_shared_rec()
-            self._init_note = note or "shared rec"
-            self._emit(f"[HPMP-OCR] rec 초기화 완료 ({self._init_note})")
-        except Exception as e:
-            self._rec = None
-            self._init_note = f"INIT-FAIL: {e}"
-            self._emit(f"[HPMP-OCR] rec 초기화 실패: {e}")
+        # HP/MP 숫자 = digit_cnn 전용 (좌표/XP 와 동일 모델). RapidOCR/Paddle 없음.
+        if self._digit_cnn is not None and self._digit_cnn.ready():
+            self._init_note = "digit_cnn only"
+        else:
+            self._init_note = "digit_cnn unavailable"
+        self._emit(f"[HPMP-OCR] {self._init_note}")
 
     def _crop_abs(self, frame: np.ndarray,
                   region: Tuple[int, int, int, int],
@@ -426,7 +413,7 @@ class HpMpReader:
                 pass
 
     def _tick(self) -> None:
-        if self._rec is None:
+        if self._digit_cnn is None or not self._digit_cnn.ready():
             return
         with self._lock:
             frame = self._latest_frame
@@ -549,15 +536,8 @@ class HpMpReader:
         if crop is None or crop.size == 0:
             return None, None
         up = _preprocess_for_ocr(crop, upscale=3, thr=20)
-        # 1순위: 숫자 CNN 세그+분류 (자릿수 정확). 빈 결과면 RapidOCR 보조.
+        # 숫자 digit_cnn 세그+분류 전용 (좌표/XP 동일 모델). fallback 없음.
         digits = self._cnn_digits(up)
-        if not digits:
-            try:
-                res = self._rec.predict(up)
-            except Exception:
-                return None, None
-            raw_text = self._extract_text(res)
-            digits = re.sub(r"[^0-9]", "", raw_text or "")
         # 숫자 CNN 학습 데이터 수집 (env OB_COLLECT_DIGITS=1 일 때만).
         try:
             from . import digit_collect
@@ -575,28 +555,3 @@ class HpMpReader:
             p = int(round(cur * 100.0 / float(max_val)))
             pct = max(0, min(100, p))
         return int(cur), pct
-
-    @staticmethod
-    def _extract_text(out) -> str:
-        try:
-            if out is None:
-                return ""
-            if isinstance(out, list):
-                parts = []
-                for item in out:
-                    if isinstance(item, dict):
-                        t = item.get("rec_text") or item.get("text") or ""
-                        if t:
-                            parts.append(str(t))
-                    elif isinstance(item, (list, tuple)):
-                        for sub in item:
-                            if isinstance(sub, dict):
-                                t = sub.get("rec_text") or sub.get("text") or ""
-                                if t:
-                                    parts.append(str(t))
-                return " ".join(parts)
-            if isinstance(out, dict):
-                return str(out.get("rec_text") or out.get("text") or "")
-        except Exception:
-            pass
-        return ""
