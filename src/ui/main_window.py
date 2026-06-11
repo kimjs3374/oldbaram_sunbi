@@ -526,19 +526,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.overlay_dlg = OverlayDialog(self)
         self.chk_overlay = self.overlay_dlg.chk_overlay
         self.chk_overlay_edit = self.overlay_dlg.chk_overlay_edit
-        self.slider_overlay_opacity = self.overlay_dlg.slider_overlay_opacity
-        self.lbl_overlay_opacity = self.overlay_dlg.lbl_overlay_opacity
         self.overlay_kind_chks = self.overlay_dlg.kind_chks
+        # 종류별 투명도 스핀 (2026-06-12 2차: 개별 조절 + 숫자 입력).
+        # 슬라이더는 다이얼로그 내부에서 스핀에 동기 — 시그널은 스핀만 연결.
+        self.overlay_op_spins = self.overlay_dlg.kind_op_spins
         self.chk_overlay.stateChanged.connect(self._on_toggle_overlay)
         self.chk_overlay_edit.stateChanged.connect(
             self._on_toggle_overlay_edit
         )
-        self.slider_overlay_opacity.valueChanged.connect(
-            self._on_overlay_opacity_changed
-        )
         for _k, _c in self.overlay_kind_chks.items():
             _c.stateChanged.connect(
                 lambda st, k=_k: self._on_overlay_kind_changed(k, st)
+            )
+        for _k, _s in self.overlay_op_spins.items():
+            _s.valueChanged.connect(
+                lambda v, k=_k: self._on_overlay_kind_opacity(k, v)
             )
         ov_row = QtWidgets.QHBoxLayout()
         ov_row.setSpacing(6)
@@ -1694,40 +1696,40 @@ class MainWindow(QtWidgets.QMainWindow):
         dur = 1.2 if cd == 1 else 1.5
         self._alert_overlay.push_countdown(key, msg, duration_sec=dur)
 
-    def _on_overlay_opacity_changed(self, v: int) -> None:
-        """투명도 슬라이더 변경 → 두 오버레이에 즉시 반영 + 저장."""
+    def _overlay_by_kind(self, kind: str):
+        """kind → 오버레이 객체 (None 가능)."""
+        return {
+            "cd": self._overlay,
+            "alert": self._alert_overlay,
+            "helper": self._helper_overlay,
+            "hpmp": self._hpmp_overlay,
+            "hunt": self._hunt_overlay,
+            "huntnav": self._hunt_nav_overlay,
+        }.get(kind)
+
+    def _overlay_opacity_for(self, kind: str) -> float:
+        """kind 별 투명도 (0.1~1.0). 스핀(숫자 입력) 값 기준."""
         try:
-            pct = int(v)
-        except Exception:
-            pct = 90
-        if pct < 10:
-            pct = 10
-        elif pct > 100:
-            pct = 100
-        try:
-            self.lbl_overlay_opacity.setText(f"{pct}%")
+            s = self.overlay_op_spins.get(kind)
+            if s is not None:
+                return max(0.1, min(1.0, int(s.value()) / 100.0))
         except Exception:
             pass
-        op = pct / 100.0
-        for ov in (self._overlay, self._alert_overlay, self._helper_overlay,
-                   self._hpmp_overlay):
-            if ov is not None:
-                try:
-                    ov.set_opacity(op)
-                except Exception:
-                    pass
+        return 0.9
+
+    def _on_overlay_kind_opacity(self, kind: str, v) -> None:
+        """종류별 투명도 변경(슬라이더/숫자 입력) → 해당 오버레이 즉시 + 저장."""
+        ov = self._overlay_by_kind(kind)
+        if ov is not None:
+            try:
+                ov.set_opacity(max(0.1, min(1.0, int(v) / 100.0)))
+            except Exception:
+                pass
         # 스킬범위 오버레이는 자체 투명도 슬라이더 사용 — 여기서 건드리지 않음.
         try:
             self._save_settings()
         except Exception:
             pass
-
-    def _current_overlay_opacity(self) -> float:
-        try:
-            return max(0.1, min(1.0,
-                                int(self.slider_overlay_opacity.value()) / 100.0))
-        except Exception:
-            return 0.9
 
     def _on_toggle_overlay(self, state) -> None:
         on = (state == QtCore.Qt.Checked)
@@ -1780,17 +1782,15 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._helper_overlay.set_alert_overlay(self._alert_overlay)
             except Exception:
                 pass
-            # 생성 직후 현재 슬라이더 값으로 투명도 적용.
-            op = self._current_overlay_opacity()
-            try:
-                self._overlay.set_opacity(op)
-                self._alert_overlay.set_opacity(op)
-                self._helper_overlay.set_opacity(op)
-                self._hpmp_overlay.set_opacity(op)
-                self._hunt_overlay.set_opacity(op)
-                self._hunt_nav_overlay.set_opacity(op)
-            except Exception:
-                pass
+            # 생성 직후 종류별 투명도 적용 (2026-06-12: 개별 조절).
+            for _k in ("cd", "alert", "helper", "hpmp", "hunt", "huntnav"):
+                _ov = self._overlay_by_kind(_k)
+                if _ov is None:
+                    continue
+                try:
+                    _ov.set_opacity(self._overlay_opacity_for(_k))
+                except Exception:
+                    pass
             # msw 창 HWND 바인딩 — 드래그/자동 앵커 둘 다 이 창 client rect
             # 안으로 clamp. 격수는 game region 지정 안 하므로 HWND 필수.
             try:

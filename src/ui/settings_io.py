@@ -82,8 +82,14 @@ def collect(mw) -> dict:
             if hasattr(mw.skill_dlg, "chk_f11_ab_combined") else True,
         # Overlay
         "overlay_on": mw.chk_overlay.isChecked(),
-        "overlay_opacity": int(mw.slider_overlay_opacity.value())
-            if hasattr(mw, "slider_overlay_opacity") else 90,
+        # legacy 단일 투명도 — 구버전 롤백 호환용 (cd 값 대표 저장).
+        "overlay_opacity": int(mw.overlay_op_spins["cd"].value())
+            if hasattr(mw, "overlay_op_spins") else 90,
+        # 종류별 투명도 (2026-06-12 개별 조절).
+        "overlay_opacity_kinds": (
+            {k: int(s.value()) for k, s in mw.overlay_op_spins.items()}
+            if hasattr(mw, "overlay_op_spins") else {}
+        ),
         # 오버레이 종류별 표시 (2026-06-12 OverlayDialog).
         "overlay_kinds": (
             {k: bool(c.isChecked())
@@ -411,24 +417,27 @@ def load(mw):
     rov = g("region_overlay_on")
     if rov is not None and hasattr(mw, "chk_region_overlay"):
         mw.chk_region_overlay.setChecked(bool(rov))
-    # Overlay 투명도 슬라이더 복원 — chk_overlay 토글보다 먼저.
-    # 이유: _on_toggle_overlay 내부 생성 경로에서 슬라이더 값을 읽어 적용하므로
+    # Overlay 투명도 복원 — chk_overlay 토글보다 먼저.
+    # 이유: _on_toggle_overlay 내부 생성 경로에서 종류별 값을 읽어 적용하므로
     # 여기서 값을 맞춰 두지 않으면 기본 90% 로 생성된 뒤 사용자 설정이 유실된다.
-    op_v = g("overlay_opacity")
-    if op_v is not None and hasattr(mw, "slider_overlay_opacity"):
-        try:
-            iv = int(op_v)
-            if iv < 10:
-                iv = 10
-            elif iv > 100:
-                iv = 100
-            # blockSignals: 여기서 valueChanged → _save_settings 재호출 방지.
-            mw.slider_overlay_opacity.blockSignals(True)
-            mw.slider_overlay_opacity.setValue(iv)
-            mw.slider_overlay_opacity.blockSignals(False)
-            mw.lbl_overlay_opacity.setText(f"{iv}%")
-        except Exception:
-            pass
+    # 신키(overlay_opacity_kinds) 우선, 없으면 legacy 단일값을 전 종류 시드.
+    try:
+        opk = g("overlay_opacity_kinds")
+        if (isinstance(opk, dict) and opk
+                and hasattr(mw, "overlay_dlg")):
+            for _k, _v in opk.items():
+                try:
+                    mw.overlay_dlg.set_kind_opacity(str(_k), int(_v))
+                except Exception:
+                    pass
+        else:
+            op_v = g("overlay_opacity")
+            if op_v is not None and hasattr(mw, "overlay_dlg"):
+                iv = max(10, min(100, int(op_v)))
+                for _k in mw.overlay_op_spins:
+                    mw.overlay_dlg.set_kind_opacity(_k, iv)
+    except Exception:
+        pass
     # 오버레이 종류별 표시 복원 (2026-06-12) — overlay_on 강제 ON 보다 먼저
     # (ON 시그널이 종류 체크 상태를 읽어 show 하므로 선복원 필수).
     ok_v = g("overlay_kinds")

@@ -148,11 +148,13 @@ class OverlayDialog(QtWidgets.QDialog):
     """오버레이 설정 전용 팝업 (2026-06-12 사용자 요청 — 별도 윈도우).
 
     위젯 생성만 담당, 시그널은 main_window 에서 연결 (SkillRangeDialog 패턴).
-    체크된 오버레이만 표시 + 위치 편집 + 투명도.
+    행마다 [체크박스 | 투명도 슬라이더 | 스핀(% 숫자 직접 입력)] —
+    오버레이별 개별 투명도 (2026-06-12 사용자 요청 2차).
+    슬라이더↔스핀은 내부 동기 — 외부(main_window)는 스핀 시그널만 연결.
 
     외부 참조 위젯:
       chk_overlay(전체 마스터), kind_chks(dict kind→QCheckBox),
-      chk_overlay_edit, slider_overlay_opacity, lbl_overlay_opacity.
+      kind_op_spins(dict kind→QSpinBox, 10~100%), chk_overlay_edit.
     """
 
     # (kind, 라벨, 툴팁) — kind 는 위치 저장 키와 동일.
@@ -168,7 +170,7 @@ class OverlayDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("오버레이 설정")
-        self.resize(300, 320)
+        self.resize(360, 340)
         root = QtWidgets.QVBoxLayout(self)
         root.setSpacing(6)
 
@@ -178,16 +180,43 @@ class OverlayDialog(QtWidgets.QDialog):
         )
         root.addWidget(self.chk_overlay)
 
-        box = QtWidgets.QGroupBox("표시할 오버레이 (체크된 것만 보임)")
-        box_lay = QtWidgets.QVBoxLayout(box)
-        box_lay.setSpacing(3)
+        box = QtWidgets.QGroupBox(
+            "표시할 오버레이 (체크된 것만 보임) · 투명도 개별 조절")
+        grid = QtWidgets.QGridLayout(box)
+        grid.setVerticalSpacing(3)
+        grid.setHorizontalSpacing(6)
         self.kind_chks: dict = {}
-        for kind, label, tip in self.KINDS:
+        self.kind_op_sliders: dict = {}
+        self.kind_op_spins: dict = {}
+        for row, (kind, label, tip) in enumerate(self.KINDS):
             c = QtWidgets.QCheckBox(label)
             c.setToolTip(tip)
             c.setChecked(True)
             self.kind_chks[kind] = c
-            box_lay.addWidget(c)
+            grid.addWidget(c, row, 0)
+            sld = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            sld.setMinimum(10)
+            sld.setMaximum(100)
+            sld.setSingleStep(5)
+            sld.setPageStep(10)
+            sld.setValue(90)
+            sld.setToolTip(f"{label} 투명도 (10~100%). 낮을수록 투명.")
+            self.kind_op_sliders[kind] = sld
+            grid.addWidget(sld, row, 1)
+            spn = QtWidgets.QSpinBox()
+            spn.setRange(10, 100)
+            spn.setValue(90)
+            spn.setSuffix("%")
+            spn.setToolTip(f"{label} 투명도 — 숫자 직접 입력 가능.")
+            self.kind_op_spins[kind] = spn
+            grid.addWidget(spn, row, 2)
+            # 내부 동기: 슬라이더 → 스핀(시그널 통과 → 외부 핸들러 1회),
+            # 스핀 → 슬라이더(차단 — 이중 발화 방지).
+            sld.valueChanged.connect(
+                lambda v, k=kind: self.kind_op_spins[k].setValue(int(v)))
+            spn.valueChanged.connect(
+                lambda v, k=kind: self._sync_slider(k, int(v)))
+        grid.setColumnStretch(1, 1)
         root.addWidget(box)
 
         self.chk_overlay_edit = QtWidgets.QCheckBox("위치 편집 (드래그로 이동)")
@@ -197,26 +226,32 @@ class OverlayDialog(QtWidgets.QDialog):
         )
         root.addWidget(self.chk_overlay_edit)
 
-        op_row = QtWidgets.QHBoxLayout()
-        op_row.addWidget(QtWidgets.QLabel("투명도"))
-        self.slider_overlay_opacity = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.slider_overlay_opacity.setMinimum(10)
-        self.slider_overlay_opacity.setMaximum(100)
-        self.slider_overlay_opacity.setSingleStep(5)
-        self.slider_overlay_opacity.setPageStep(10)
-        self.slider_overlay_opacity.setValue(90)
-        self.slider_overlay_opacity.setToolTip(
-            "오버레이 창 전체 투명도. 값이 낮을수록 투명."
-        )
-        self.lbl_overlay_opacity = QtWidgets.QLabel("90%")
-        self.lbl_overlay_opacity.setFixedWidth(36)
-        op_row.addWidget(self.slider_overlay_opacity, 1)
-        op_row.addWidget(self.lbl_overlay_opacity)
-        root.addLayout(op_row)
-
         btn_close = QtWidgets.QPushButton("닫기")
         btn_close.clicked.connect(self.hide)
         root.addWidget(btn_close)
+
+    def _sync_slider(self, kind: str, v: int) -> None:
+        sld = self.kind_op_sliders.get(kind)
+        if sld is None or sld.value() == v:
+            return
+        sld.blockSignals(True)
+        try:
+            sld.setValue(int(v))
+        finally:
+            sld.blockSignals(False)
+
+    def set_kind_opacity(self, kind: str, pct: int) -> None:
+        """프로그램(설정 복원)용 — 시그널 없이 슬라이더+스핀 동시 세팅."""
+        pct = max(10, min(100, int(pct)))
+        for w in (self.kind_op_sliders.get(kind),
+                  self.kind_op_spins.get(kind)):
+            if w is None:
+                continue
+            w.blockSignals(True)
+            try:
+                w.setValue(pct)
+            finally:
+                w.blockSignals(False)
 
 
 class SkillRangeDialog(QtWidgets.QDialog):
