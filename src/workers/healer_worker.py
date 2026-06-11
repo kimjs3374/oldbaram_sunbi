@@ -1842,7 +1842,12 @@ class HealerWorker(QtCore.QThread):
                             if self._sched else False
                     except Exception:
                         seq_blocking = False
-                    block_by_white = (white_raw and not seq_blocking)
+                    # 2026-06-11 사용자 지적: 빨탭(red_raw)이 동시에 검출되면
+                    # YOLO 흰탭 오검출(false white)로 간주 → block 안 함. 게임상
+                    # 빨탭 락이면 흰탭 커서는 없음, 공존=오검출이라 빨탭 우선 이동.
+                    # (23,1 빨탭인데 흰탭 박스도 떠 WHITETAB-BLOCK 정지한 사고.)
+                    block_by_white = (white_raw and not red_raw
+                                      and not seq_blocking)
                     # TAB-CONFIRM 진행 중엔 confirm 누적 금지.
                     # (active 풀리는 순간 쌓인 confirm이 한꺼번에 폭발해
                     #  Tab 재송신되는 문제 방지. 2026-04-18 로그에서 confirm=13
@@ -2761,24 +2766,26 @@ class HealerWorker(QtCore.QThread):
                             f"h={h} exit={getattr(fol, '_exit_coord', None)})"
                         )
                         self._portal_enter_logged = True
-                # 2026-06-11 근본수정: 포탈 좌표(_exit_coord) 직행 우선.
-                # 기존 exit_dir 방향키만으론 한 축만 밀어 x(또는 y) 안 맞으면
-                # 벽에 막혀 멍때림 (healer-120 follow_only 41s: 포탈 (7,0)인데
-                # exit_dir U로 위만 밀다 (9,2)(11,2) blocked=U 벽). 좌표로 가면
-                # x·y 둘 다 맞춰 직행. STUCK 필터가 벽 우회까지 처리.
-                ec = getattr(fol, "_exit_coord", None)
-                if ec is not None and h is not None:
-                    ex, ey = ec
-                    if abs(ex - h[0]) + abs(ey - h[1]) > tol:
-                        dx, dy = ex - h[0], ey - h[1]
-                        w = (("R" if dx > 0 else "L")
-                             if abs(dx) >= abs(dy)
-                             else ("D" if dy > 0 else "U"))
-                        remain = fol.force_exit_remaining()
-                        return w, (
-                            f"FORCE-EXIT-PORTAL coord={ec} h={h} "
-                            f"remain={remain:.2f}s"
-                        )
+                # 2026-06-11 사용자 명시: 포탈좌표 직행 폐기 → 격수 trail 순서대로.
+                # 직행(_exit_coord)은 격수가 우회한 벽에 박힘 (시뻑구(7) 출구
+                # (0,6) 직행 L 벽 STUCK 62회). 격수가 밟은 trail = 검증된 통로 →
+                # 그대로 따라가면 벽 회피. trail 끝(포탈 직전) 도달하면 exit_dir 밀기.
+                if h is not None:
+                    wp = fol.next_waypoint(self.healer_map, h, tol=tol,
+                                           exit_dash=False)
+                    if wp is not None:
+                        wx, wy = wp
+                        if abs(wx - h[0]) + abs(wy - h[1]) > tol:
+                            dx, dy = wx - h[0], wy - h[1]
+                            w = (("R" if dx > 0 else "L")
+                                 if abs(dx) >= abs(dy)
+                                 else ("D" if dy > 0 else "U"))
+                            remain = fol.force_exit_remaining()
+                            return w, (
+                                f"FORCE-EXIT-TRAIL wp={wp} h={h} "
+                                f"remain={remain:.2f}s"
+                            )
+                # trail 끝 도달 → exit_dir 밀어 맵 전환.
                 exit_d = fol.exit_dir()
                 if exit_d in ("L", "R", "U", "D"):
                     remain = fol.force_exit_remaining()
@@ -2806,12 +2813,13 @@ class HealerWorker(QtCore.QThread):
             # 격수 맵 전환 → 정지 latch 해제 (수정 2: 새 맵에선 추종 재개).
             self._follow_parked = False
             # 2026-04-22 trail_tol=1 (각 wp ±1 도달 허용).
-            # 2026-04-23 exit_dash=True (map_neq 중): 격수 전투 zigzag trail을
-            # 스킵하고 exit에 가장 가까운 직선 도달 가능 wp로 직행 → 포탈 통과
-            # 최단 경로. 14:49:01~05 힐러 (5,11)→(10,*) 헛걸음 5초 낭비 해결.
+            # 2026-06-11 사용자 명시: exit_dash=True(지름길/직행) 폐기 → False.
+            # 격수가 벽 피해 간 trail 순서대로 밟아야 (7) 등 벽막힘 회피. 지름길로
+            # 직행하면 격수가 우회한 벽에 박혀 STUCK 헤맴(시뻑구(7) 출구 (0,6)
+            # 직행 L 벽 STUCK 62회). 격수 경로 = 이미 검증된 통로.
             trail_tol = 1
             wp = fol.next_waypoint(self.healer_map, h, tol=trail_tol,
-                                   exit_dash=True)
+                                   exit_dash=False)
             # 진단 로그 — wp 반환값 변경시 or 0.5초 스로틀.
             diag = fol.wp_diag()
             if diag is not None:
