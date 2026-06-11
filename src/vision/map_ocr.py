@@ -1,20 +1,19 @@
-"""맵 이름 OCR 백그라운드 워커 (PaddleOCR TextRecognition).
+"""맵 이름 OCR 백그라운드 워커 (RapidOCR korean rec-only).
 
 [목적]
-- PaddleOCR korean_PP-OCRv5_mobile_rec 은 CPU 빌드에서 ~230ms/호출 소요.
-  메인 루프에서 직접 호출하면 맵 OCR 주기마다 그만큼 FPS 손실.
-- 이 워커는 별도 스레드에서 PaddleOCR 을 돌려 메인 루프 블로킹을 0으로
-  만든다. 메인은 `submit_frame()` 으로 최신 프레임만 원자적 전달하고
-  `latest()` 로 마지막 완료 결과를 비블로킹 조회.
+- 맵 OCR 을 메인 루프에서 떼어 별도 스레드에서 돌려 블로킹을 0으로 만든다.
+  메인은 `submit_frame()` 으로 최신 프레임만 원자적 전달하고 `latest()` 로
+  마지막 완료 결과를 비블로킹 조회.
 
 [정확도]
-- PaddleOCR 인스턴스와 crop 로직(_find_map_bar/_crop_map) 모두 ocr.py 와
-  동일 규칙 복제. 모델/전처리 동일 → 결과 품질 동일.
+- crop 로직(_find_map_bar/_crop_map)은 ocr.py 와 동일 규칙 복제. 인식은
+  map_rapidocr(RapidOCR korean rec-only) — 노이즈 제거 + X-Y(Z) 구조 정규화
+  까지 모듈이 담당. torch/paddle 의존 0.
 
 [동기화]
 - 최신 프레임 한 장만 유지 (덮어쓰기). OCR 이 늦으면 중간 프레임은 버림.
   맵 이름은 초 단위 변경이라 frame-skip 허용.
-- `map_interval_s` 스로틀은 워커 루프에도 걸어 GPU/CPU 과부하 방지.
+- `interval_s` 스로틀은 워커 루프에도 걸어 과부하 방지.
 
 API:
     worker = MapOcrWorker(map_w=400, map_h=40, map_top_pad=0,
@@ -26,7 +25,6 @@ API:
 """
 from __future__ import annotations
 
-import os
 import pathlib
 import threading
 import time
@@ -36,17 +34,12 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
-# paddlepaddle onednn 내부 버그 회피 (ocr.py / cooldown_ocr.py 와 동일).
-os.environ.setdefault("FLAGS_use_mkldnn", "0")
-os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
-
 _PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
-_KOREAN_REC_DIR = _PROJECT_ROOT / "models" / "korean_PP-OCRv5_mobile_rec"
 
 
 @dataclass
 class MapOcrReading:
-    raw: str = ""        # 정제 전 rec_text 조인 ("_clean_map_text" 는 호출자 담당).
+    raw: str = ""        # map_rapidocr 노이즈제거+구조정규화 완료 raw. knownmaps 보정은 ocr.py.
     ts: float = 0.0      # OCR 완료 시각 (time.time()).
     cycle_ms: float = 0.0  # 가장 최근 predict + crop 소요.
     crop_h: int = 0
@@ -56,8 +49,8 @@ class MapOcrReading:
 class MapOcrWorker:
     """맵 이름 OCR 백그라운드 워커.
 
-    ocr.py 의 _find_map_bar / _crop_map / _extract_texts 와 동일 규칙을
-    스레드 내에서 실행. 메인 Ocr 객체와 독립된 PaddleOCR 인스턴스를 소유.
+    ocr.py 의 _find_map_bar / _crop_map 와 동일 규칙을 스레드 내에서 실행.
+    인식은 map_rapidocr(RapidOCR, 모듈 싱글톤) — torch/paddle 의존 0.
     """
 
     def __init__(
@@ -74,8 +67,6 @@ class MapOcrWorker:
         self.map_left_pad = int(map_left_pad)
         self.interval_s = max(0.1, float(interval_s))
 
-        self._rec = None
-        self._crnn = None  # 맵 CRNN (PaddleOCR 대체, 학습된 게임폰트)
         self._init_note: str = ""
 
         self._lock = threading.Lock()
@@ -123,48 +114,12 @@ class MapOcrWorker:
     # 지연 초기화
     # -----------------------------------------------------------------
     def _ensure_rec(self) -> None:
-        # 2026-06-11 CRNN 임시 비활성: 66종 통째 암기(과적합)라 학습에 없는
-        # 숫자 조합(x,y 바뀜)을 못 읽음. 숫자 char digit_cnn 재설계 전까지
-        # PaddleOCR fallback 사용(새 조합은 읽음). self._crnn 영구 None.
-        self._crnn = None
-        if self._rec is not None:
-            return
+        # RapidOCR(map_rapidocr) 모듈 싱글톤. 여기선 준비 확인만.
         try:
-            from paddleocr import TextRecognition
-            kwargs = dict(
-                model_name="korean_PP-OCRv5_mobile_rec",
-                enable_mkldnn=False,
-            )
-            if _KOREAN_REC_DIR.is_dir():
-                kwargs["model_dir"] = str(_KOREAN_REC_DIR)
-            # 2026-06-10: GPU 우선으로 전환. 기존 CPU 강제는 "YOLO가 GPU" 전제
-            # 였으나 현재 YOLO는 ONNX CPU(device=-1)라 GPU 비어있음. 맵 PaddleOCR
-            # 이 CPU(267ms)를 점유해 YOLO/좌표 ONNX와 경합 → 스파이크 유발.
-            # GPU로 옮기면 CPU 여유 → 좌표 지연 해소. 게임 GPU 경합은 맵 OCR이
-            # 0.5s throttle 이라 점유 짧음. GPU 없으면 CPU fallback(저사양 안전).
-            note_prefix = (f"local {_KOREAN_REC_DIR}" if _KOREAN_REC_DIR.is_dir()
-                           else "online korean_PP-OCRv5_mobile_rec")
-            attempts = [
-                ({"device": "gpu"}, "GPU(device=gpu)"),
-                ({"use_gpu": True}, "GPU(use_gpu=True)"),
-                ({"device": "cpu"}, "CPU(device=cpu)"),
-                ({"use_gpu": False}, "CPU(use_gpu=False)"),
-                ({}, "DEFAULT"),
-            ]
-            for extra, mode in attempts:
-                try:
-                    self._rec = TextRecognition(**extra, **kwargs)
-                    self._init_note = f"{note_prefix} / {mode}"
-                    break
-                except Exception:
-                    continue
-            if self._rec is None:
-                self._rec = TextRecognition(**kwargs)
-                self._init_note = f"{note_prefix} / DEFAULT(fallback)"
-            # warmup — 첫 predict 는 graph compile 로 1~2s 걸림.
-            list(self._rec.predict(np.zeros((48, 320, 3), dtype=np.uint8)))
+            from . import map_rapidocr
+            self._init_note = ("RapidOCR(korean) rec-only"
+                               if map_rapidocr.ready() else "RapidOCR 모델 없음")
         except Exception as e:
-            self._rec = None
             self._init_note = f"fail {type(e).__name__}: {e}"
 
     # -----------------------------------------------------------------
@@ -183,35 +138,13 @@ class MapOcrWorker:
             if self._stop_evt.wait(wait):
                 break
 
-    def _save_collect(self, crop) -> None:
-        """미학습/저신뢰 맵 crop 수집 (logs/map_crops/). throttle 1.5s.
-
-        학습된 맵은 conf 높아 호출 안 됨 → 새 맵/불확실만 모인다.
-        종료 시 cloud_map_upload 가 자동 업로드(main_window.closeEvent).
-        """
-        now = time.monotonic()
-        if now - getattr(self, "_last_collect_ts", 0.0) < 1.5:
-            return
-        self._last_collect_ts = now
-        try:
-            import pathlib
-            d = pathlib.Path.cwd() / "logs" / "map_crops"
-            d.mkdir(parents=True, exist_ok=True)
-            n = getattr(self, "_collect_n", 0) + 1
-            self._collect_n = n
-            fn = f"{time.strftime('%H%M%S')}_c{n:04d}.png"
-            cv2.imwrite(str(d / fn), crop)
-        except Exception:
-            pass
-
     def _one_cycle(self) -> None:
-        # RapidOCR(korean) 우선 — 일반 OCR이라 숫자 조합무관, 한글 정확.
         try:
             from . import map_rapidocr
             _rapid_ok = map_rapidocr.ready()
         except Exception:
             _rapid_ok = False
-        if self._rec is None and not _rapid_ok:
+        if not _rapid_ok:
             return
         with self._lock:
             frame = self._latest_frame
@@ -227,18 +160,10 @@ class MapOcrWorker:
         if crop is None or crop.size == 0:
             return
         raw = ""
-        # RapidOCR(korean) 우선 (한글+숫자 ~100%, 조합무관). 빈값이면 PaddleOCR.
-        if _rapid_ok:
-            try:
-                raw = map_rapidocr.read_map(crop)
-            except Exception:
-                raw = ""
-        if not raw and self._rec is not None:
-            try:
-                preds = self._rec.predict(crop)
-                raw = " ".join(self._extract_texts(preds))
-            except Exception:
-                raw = ""
+        try:
+            raw = map_rapidocr.read_map(crop)
+        except Exception:
+            raw = ""
         cycle_ms = (time.perf_counter() - t_start) * 1000
 
         with self._lock:
@@ -345,22 +270,3 @@ class MapOcrWorker:
         except Exception:
             pass
         return c, crop_h, crop_scale
-
-    @staticmethod
-    def _extract_texts(preds) -> List[str]:
-        out: List[str] = []
-        for r in preds:
-            texts = None
-            if hasattr(r, "get"):
-                texts = r.get("rec_texts")
-                if texts is None:
-                    t = r.get("rec_text")
-                    texts = [t] if t else []
-            if not texts:
-                try:
-                    t = r["rec_text"]
-                    texts = [t] if t else []
-                except Exception:
-                    texts = []
-            out.extend([x for x in texts if x])
-        return out

@@ -73,10 +73,10 @@ def collect_files() -> List[pathlib.Path]:
                 continue
             if ".bak" in p.name:  # .bak / .bak.v6 / .bak.pre_rollback 등 백업 전부
                 continue
-            if "easyocr" in p.parts:
-                # craft 83MB 가 Supabase 파일 크기 제한(50MB) 초과 → 업로드 제외.
-                # ocr.py 는 models/easyocr 폴더가 없으면 EasyOCR 이 첫 실행 시
-                # 인터넷에서 자동 다운로드(download_enabled 기본 True)하므로 동작 OK.
+            if ("easyocr" in p.parts
+                    or "korean_PP-OCRv5_mobile_rec" in p.parts):
+                # 2026-06-11 PaddleOCR/EasyOCR 제거 → 죽은 모델 디렉토리.
+                # 사용자 머신에 잔존해도 업로드/배포에서 제외(경량화).
                 continue
             out.append(p)
     for f in _INCLUDE_FILES:

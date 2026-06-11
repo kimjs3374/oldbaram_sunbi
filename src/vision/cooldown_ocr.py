@@ -1,13 +1,15 @@
 """쿨다운 창 OCR + 닉네임 OCR (백그라운드 스레드).
 
 [설계 원칙]
-- 메인 루프 블로킹 금지. PaddleOCR.predict는 100~500ms 걸리므로
-  별도 스레드에서 수행. 메인은 `submit_frame()`으로 최신 프레임만 원자적으로
-  전달하고, `latest()`로 마지막 완료 결과를 비블로킹 조회한다.
+- 메인 루프 블로킹 금지. OCR 은 별도 스레드에서 수행. 메인은
+  `submit_frame()`으로 최신 프레임만 원자적으로 전달하고, `latest()`로
+  마지막 완료 결과를 비블로킹 조회한다.
 - 흰탭 TAB-CONFIRM 3프레임 안정성 판정이 OCR 블로킹 때문에 깨지는 회귀를
   방지한다 (2026-04-17 사용자 보고).
 - 비침습. OCR 실패 = -1 반환. region 미지정 시 전체 비활성.
-- 쿨다운 + 닉네임을 한 스레드에서 순차 OCR — PaddleOCR 인스턴스 공유.
+- 쿨다운 + 닉네임을 한 스레드에서 순차 OCR — RapidOCR(rec-only) 공유.
+- 인식 결과는 대상 스킬 리스트 기반 fuzzy 매칭(_lev1_same_len)으로 보정 →
+  "어검술↔어검습", "이기어검↔미기머검" 같은 한글 오인식 복구.
 
 대상 스킬 (하드코딩):
 - 파력무참 : SkillScheduler 180s.
@@ -37,59 +39,36 @@ from typing import Dict, List, Optional, Tuple, Union
 import cv2
 import numpy as np
 
-# paddlepaddle onednn 내부 버그 회피 (ocr.py와 동일).
-os.environ.setdefault("FLAGS_use_mkldnn", "0")
-os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
-
 _PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
-_KOREAN_REC_DIR = _PROJECT_ROOT / "models" / "korean_PP-OCRv5_mobile_rec"
 
-# 2026-04-21: 공유 TextRecognition. 여러 CooldownOcr 인스턴스(쿨/버프/채팅)
-# 가 동일 모델을 쓰고 predict 호출만 _SHARED_REC_LOCK 으로 serialize.
-# GPU VRAM 4중 점유 → 1중. PaddleOCR 동시 predict 경쟁 → 순차 실행.
+# 공유 RapidOCR rec. 여러 CooldownOcr 인스턴스(쿨/버프/채팅)가 동일 엔진 공유.
+# RapidOCR 는 경량(onnxruntime CPU)이라 동시 predict 안전 → lock 불필요(no-op).
 _SHARED_REC = None
 _SHARED_REC_LOCK = threading.Lock()
 _SHARED_REC_NOTE = ""
 
 
-def _get_shared_rec():
-    """프로세스 단일 TextRecognition 인스턴스. lazy init.
+class _RapidRec:
+    """RapidOCR(korean rec-only) 어댑터. predict(crop) -> [{"rec_text": str}].
 
-    2026-04-21: PaddleOCR 를 CPU 로 강제. GPU 는 YOLO 전용.
-    PaddleOCR + YOLO 동시 GPU 사용 시 경합으로 YOLO predict 수백 ms 치솟음.
-    다중 시그니처 호환: device / use_gpu / gpu_mem 등 버전별 키가 달라
-    한 번 실패해도 순서대로 다른 키를 시도.
-    """
+    쿨/버프/닉/HP/MP 의 기존 라인 파싱 코드가 dict 리스트를 기대하므로 그
+    형태로 감싼다. 경량(onnxruntime CPU, ~12ms). torch/paddle 의존 0."""
+
+    def predict(self, crop):
+        from .map_rapidocr import read_text
+        return [{"rec_text": read_text(crop)}]
+
+
+def _get_shared_rec():
+    """프로세스 단일 RapidOCR 어댑터. lazy init (쿨/버프/닉/HP/MP 공유)."""
     global _SHARED_REC, _SHARED_REC_NOTE
     if _SHARED_REC is not None:
         return _SHARED_REC, _SHARED_REC_NOTE
     with _SHARED_REC_LOCK:
         if _SHARED_REC is not None:
             return _SHARED_REC, _SHARED_REC_NOTE
-        from paddleocr import TextRecognition
-        _kwargs = {"model_name": "korean_PP-OCRv5_mobile_rec"}
-        if _KOREAN_REC_DIR.exists():
-            _kwargs["model_dir"] = str(_KOREAN_REC_DIR)
-        # 2026-04-22: GPU 기본 복귀. 이전 CPU 강제 실험 결과 py-spy 로
-        # hpmp_ocr 스레드가 CPU 96.9% 점유 (PaddleOCR predict 500ms 초과 →
-        # poll_sec 0.5s 안에 못 끝나 연속 돌면서 shared_rec_lock 경합).
-        # 격수 ON 시 cooldown_ocr 도 바빠져 락 경합 폭증 → main fps 10.
-        attempts = [
-            ({}, "shared DEFAULT(GPU)"),
-            ({"device": "gpu"}, "shared GPU(device=gpu)"),
-            ({"use_gpu": True}, "shared GPU(use_gpu=True)"),
-        ]
-        for extra, note in attempts:
-            try:
-                _SHARED_REC = TextRecognition(**extra, **_kwargs)
-                _SHARED_REC_NOTE = note
-                break
-            except Exception:
-                continue
-        if _SHARED_REC is None:
-            # 끝까지 실패 — 마지막 예외 그대로 올림.
-            _SHARED_REC = TextRecognition(**_kwargs)
-            _SHARED_REC_NOTE = "shared DEFAULT(fallback)"
+        _SHARED_REC = _RapidRec()
+        _SHARED_REC_NOTE = "shared RapidOCR(korean) rec-only"
     return _SHARED_REC, _SHARED_REC_NOTE
 
 
@@ -109,15 +88,10 @@ _NOOP_LOCK = _NoopLock()
 
 
 def get_shared_rec_lock():
-    """2026-04-22: 진짜 Lock → NoopLock.
+    """shared rec lock → NoopLock (병렬 predict 허용).
 
-    이전: shared rec 하나를 hpmp/cooldown/buff/chat/map OCR 이 `Lock` 으로
-    직렬화 → 격수 ON 시 cooldown_ocr 가 자주 돌면서 lock 경합 폭증 →
-    hpmp_ocr predict 가 대기로 500ms+ 걸려 fps 10 드롭.
-
-    PaddleOCR predict 는 내부적으로 GIL 해제 + GPU kernel queue 자동 관리로
-    병렬 호출 안전. Lock 제거로 OCR 간 블로킹 0. GPU 자체 capacity 는 Paddle
-    스케줄러가 관리.
+    RapidOCR(onnxruntime CPU) predict 는 병렬 호출 안전 → 직렬화 lock 제거로
+    OCR 간 블로킹 0. (이전 PaddleOCR 시절 lock 경합으로 fps 드롭하던 문제 해소.)
     """
     return _NOOP_LOCK
 
@@ -140,8 +114,8 @@ def _lev1_same_len(target: str, cand: str) -> bool:
     """동일 길이 편집거리 fuzzy 매칭. target 길이 < 3 이면 False.
 
     - 길이 3 : 1 diff 까지 허용 ("어검술"↔"어검습").
-    - 길이 4+: 2 diff 까지 허용 ("이기어검"↔"미기머검" 같은 Paddle 의
-      ㅇ→ㅁ 일관 오인식 복구). 4자 중 2자 차이면 50% 보존 → 실용 안전선.
+    - 길이 4+: 2 diff 까지 허용 ("이기어검"↔"미기머검" 같은 한글 자모
+      오인식 복구). 4자 중 2자 차이면 50% 보존 → 실용 안전선.
     길이 다른 경우는 매칭 안 함 → "파력무참"↔"파력무참진" 부분일치 오탐 차단.
     """
     if not target or not cand or len(target) < 3:
@@ -209,10 +183,8 @@ class CooldownOcr:
         self._region: Optional[Tuple[int, int, int, int]] = None
         self._nick_region: Optional[Tuple[int, int, int, int]] = None
         self._rec = None
-        # 2026-04-22: own_rec=True 면 shared rec 공유 대신 전용 TextRecognition
-        # 인스턴스 생성. 이유: PaddleOCR predict 동시 호출 시 동일 인스턴스 내부
-        # 상태 경합으로 빈 결과 반환되는 케이스 관측 (buff_ocr 가 cd_ocr 에
-        # 밀려 raw_text=''). buff_ocr 는 1Hz 로만 돌아 전용 rec 비용 미미.
+        # own_rec 플래그(레거시): RapidOCR 는 경량 공유로 충분 → _ensure_rec 가
+        # 항상 shared rec 사용. 동시 predict 안전이라 전용 인스턴스 불필요.
         self._own_rec: bool = bool(own_rec)
         self._last_read = CooldownReading()
         self._init_note: str = ""
@@ -352,34 +324,10 @@ class CooldownOcr:
     def _ensure_rec(self) -> None:
         if self._rec is not None:
             return
-        # 2026-04-22: shared rec 복귀 + lock 은 이미 no-op. 각자 rec 했더니
-        # VRAM/GPU context 부담 증가로 fps 48 까지 떨어짐. shared 모델 객체는
-        # OK, 문제는 lock 경합만이었음 — lock 만 무력화.
-        # own_rec=True: 전용 rec. predict 경합 회피용 (buff_ocr).
-        if self._own_rec:
-            try:
-                from paddleocr import TextRecognition
-                _kwargs = {"model_name": "korean_PP-OCRv5_mobile_rec"}
-                if _KOREAN_REC_DIR.exists():
-                    _kwargs["model_dir"] = str(_KOREAN_REC_DIR)
-                for extra, note in [
-                    ({}, "own DEFAULT(GPU)"),
-                    ({"device": "gpu"}, "own GPU(device=gpu)"),
-                    ({"use_gpu": True}, "own GPU(use_gpu=True)"),
-                ]:
-                    try:
-                        self._rec = TextRecognition(**extra, **_kwargs)
-                        self._init_note = note
-                        return
-                    except Exception:
-                        continue
-                # 끝까지 실패 → shared 로 fallback.
-            except Exception as e:
-                self._init_note = f"own-fail {type(e).__name__}: {e}"
-                self._rec = None
+        # RapidOCR 어댑터(rec-only) shared 공용. 경량이라 전용 인스턴스 불필요.
         try:
             self._rec, note = _get_shared_rec()
-            self._init_note = note or "shared rec"
+            self._init_note = note or "shared RapidOCR rec"
         except Exception as e:
             self._rec = None
             self._init_note = f"fail {type(e).__name__}: {e}"
@@ -496,7 +444,7 @@ class CooldownOcr:
     ) -> list:
         """수평 projection으로 텍스트 라인 band를 찾아 (y0, y1) 리스트 반환.
 
-        PP-OCRv5 TextRecognition은 detection 없는 **단일 라인** 인식기 →
+        RapidOCR rec-only 는 detection 없는 **단일 라인** 인식기 →
         2줄 이상 crop을 통으로 넣으면 빈 결과. 각 줄별로 분리 필수.
 
         2026-04-21: threshold 고정 170 은 밝은 글자/어두운 배경 전제.
@@ -557,9 +505,9 @@ class CooldownOcr:
         """
         all_lines: list = []
         bands = self._split_text_bands(crop)
-        # 2줄 쿨다운 UI가 한 band로 합쳐지면 PaddleOCR이 두 줄을 가로로
-        # 이어붙여 "박무참 36초 | 홍의희원 23초" 같은 단일 라인으로 읽어 숫자
-        # 탈락 잦음. band 1개 + 높이가 crop의 30% 이상이면 상/하 강제 2등분.
+        # 2줄 쿨다운 UI가 한 band로 합쳐지면 rec 가 두 줄을 가로로 이어붙여
+        # "박무참 36초 | 홍의희원 23초" 같은 단일 라인으로 읽어 숫자 탈락 잦음.
+        # band 1개 + 높이가 crop의 30% 이상이면 상/하 강제 2등분.
         if len(bands) == 1:
             y0, y1 = bands[0]
             bh = y1 - y0
@@ -588,7 +536,7 @@ class CooldownOcr:
                         all_lines.append(ln)
         # 2026-04-22: bands 검출됐어도 각 sub-predict 가 전부 0 라인이면
         # 전체 crop 통으로 fallback predict. 격수 버프 영역(배경/폰트 이질)
-        # 에서 band 절단 crop 이 TextRecognition 에 인식 안 되는 케이스 대응.
+        # 에서 band 절단 crop 이 rec 에 인식 안 되는 케이스 대응.
         if not all_lines:
             try:
                 up3 = cv2.resize(

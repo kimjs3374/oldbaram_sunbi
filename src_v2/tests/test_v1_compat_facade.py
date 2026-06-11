@@ -6,7 +6,7 @@ v1 main_window.py 가 worker.* 로 접근하는 attribute/method/signal 이
 v2 facade (HealerWorkerV1Facade / AttackerWorkerV1Facade) 에 모두
 노출되는지 정적 검증. 사용자 PC 의존성 0 (PyQt5 import + introspection).
 
-본 테스트는 CI 단독에서 실행 가능 — 외부 라이브러리 (mss/torch/easyocr) 미사용.
+본 테스트는 CI 단독에서 실행 가능 — 외부 라이브러리 (mss/torch/rapidocr) 미사용.
 실제 워커 start 도 안 함. 인터페이스 매칭만 본다.
 """
 from __future__ import annotations

@@ -16,15 +16,13 @@ torchvision==0.20.1+cu124
 ultralytics==8.4.37
 ultralytics-thop==2.0.18
 
-# --- OCR ---
-# PaddleOCR: 맵이름 한국어 (models/korean_PP-OCRv5_mobile_rec 로컬 모델)
-# EasyOCR: 좌표 숫자 (GPU 10~20ms, 최초 실행 시 모델 자동 다운로드)
-paddleocr==3.4.0
-paddlepaddle==3.3.1
-easyocr==1.7.2
-
-# --- 경량 CPU 추론 (nano YOLO ONNX + 좌표 숫자 CNN; GPU 없는 PC 지원) ---
+# --- OCR / 경량 CPU 추론 (onnxruntime CPU) ---
+# 2026-06-11 PaddleOCR/EasyOCR 완전 제거. 단일 경량 스택:
+#   맵/텍스트 = RapidOCR(korean rec-only, src/vision/korean_rec.onnx 13MB)
+#   좌표/HP/MP/XP 숫자 = digit_cnn(src/vision/digit_cnn.onnx)
+#   nano YOLO 도 ONNX. torch 는 YOLO(ultralytics) 전용으로만 남음.
 onnxruntime==1.20.1
+rapidocr_onnxruntime
 
 # --- 비전/캡처 ---
 opencv-python==4.13.0.92
@@ -40,4 +38,3 @@ pywin32==311
 
 # --- 설정 파일 ---
 PyYAML==6.0.2
-rapidocr_onnxruntime

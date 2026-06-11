@@ -1,8 +1,8 @@
 """경험치 영역 OCR + 시간당 예상 경험치 추정.
 
 HealerWorker에서 xp_region 지정 시에만 활성. CooldownOcr처럼 submit_frame +
-백그라운드 스레드 구조. OCR 엔진은 cooldown_ocr과 동일한 paddleocr
-korean rec을 재사용할 수도 있으나 여기선 독립 인스턴스 (락 경합 회피).
+백그라운드 스레드 구조. XP 숫자 인식 = digit_cnn 전용(좌표 CNN 재사용).
+torch/paddle 의존 0.
 
 추정 모델:
   session_start_ts 고정. 매 OCR마다 xp 값 읽고, 감소하면 "레벨업" 간주해
@@ -24,11 +24,6 @@ import cv2
 import numpy as np
 
 
-_KOREAN_REC_DIR = pathlib.Path(__file__).resolve().parents[2] / (
-    "models/korean_PP-OCRv5_mobile_rec"
-)
-
-
 def fmt_per_hour(n: int) -> str:
     """시간당 경험치 정수 → 'xx.x억' 문자열. 0 이하 '-'."""
     if n is None or n <= 0:
@@ -42,10 +37,9 @@ class XpOcr:
     def __init__(self, poll_sec: float = 2.0, log_cb=None):
         self.poll_sec = max(0.5, float(poll_sec))
         self._region: Optional[Tuple[int, int, int, int]] = None
-        self._rec = None
         # 숫자 CNN (2026-06-10 v16): XP도 green_mask 전처리 적용 시 세그 깔끔
         # (raw 14박스 노이즈 → green전처리 11박스 정확, 실측 확인). 좌표
-        # digit_cnn 재사용 — XP 자릿수 삽입/오독 해결. 빈/실패시 PaddleOCR.
+        # digit_cnn 재사용 — XP 자릿수 삽입/오독 해결. fallback 없음(전용).
         self._digit_cnn = None
         try:
             from .digit_cnn import DigitCnn
@@ -147,11 +141,10 @@ class XpOcr:
         save_debug=True면 crop/upscale PNG를 logs/xp_ocr_debug/*.png 에 저장.
         반환 dict: {ok, xp, raw_text, diag, crop_shape, debug_path}
         """
-        self._ensure_rec()
-        if self._rec is None:
+        if self._digit_cnn is None or not self._digit_cnn.ready():
             return {
                 "ok": False, "xp": None, "raw_text": "",
-                "diag": f"rec init failed: {self._init_note}",
+                "diag": "digit_cnn unavailable",
                 "crop_shape": None, "debug_path": "",
             }
         if self._region is None:
@@ -190,16 +183,8 @@ class XpOcr:
                 debug_path = str(crop_p)
             except Exception as e:
                 debug_path = f"(save fail: {e})"
-        try:
-            out = self._rec.predict(up)
-        except Exception as e:
-            return {
-                "ok": False, "xp": None, "raw_text": "",
-                "diag": f"predict err: {e}",
-                "crop_shape": crop.shape[:2],
-                "debug_path": debug_path,
-            }
-        text = self._extract_text(out)
+        from .hpmp import _preprocess_for_ocr
+        text = self._cnn_digits(_preprocess_for_ocr(crop, upscale=3, thr=20))
         xp = self._parse_int(text)
         if xp is None:
             return {
@@ -225,34 +210,8 @@ class XpOcr:
             pass
 
     def _ensure_rec(self) -> None:
-        if self._rec is not None:
-            return
-        try:
-            from paddleocr import TextRecognition
-            _base = {"model_name": "korean_PP-OCRv5_mobile_rec"}
-            if _KOREAN_REC_DIR.exists():
-                _base["model_dir"] = str(_KOREAN_REC_DIR)
-                _note_suffix = f"local {_KOREAN_REC_DIR}"
-            else:
-                _note_suffix = "online korean_PP-OCRv5_mobile_rec"
-            # CPU 강제 — GPU는 YOLO 전용. PaddleOCR + YOLO 동시 GPU 사용 시
-            # 경합으로 YOLO predict 수백~수천 ms 치솟음. (map_ocr.py 동일 정책)
-            for _extra, _label in [
-                ({"device": "cpu"}, f"CPU(device=cpu) {_note_suffix}"),
-                ({"use_gpu": False}, f"CPU(use_gpu=False) {_note_suffix}"),
-                ({}, f"default {_note_suffix}"),
-            ]:
-                try:
-                    self._rec = TextRecognition(**_extra, **_base)
-                    self._init_note = _label
-                    break
-                except TypeError:
-                    continue
-            self._emit(f"[XP-OCR] rec 초기화 완료 ({self._init_note})")
-        except Exception as e:
-            self._rec = None
-            self._init_note = f"INIT-FAIL: {e}"
-            self._emit(f"[XP-OCR] rec 초기화 실패: {e}")
+        # XP 숫자 = digit_cnn 전용 (PaddleOCR/RapidOCR fallback 없음).
+        self._init_note = "digit_cnn only"
 
     def _loop(self) -> None:
         try:
@@ -266,8 +225,8 @@ class XpOcr:
                 self._last_diag = f"tick err: {e}"
 
     def _tick(self) -> None:
-        if self._rec is None:
-            self._last_diag = "no rec"
+        if self._digit_cnn is None or not self._digit_cnn.ready():
+            self._last_diag = "no digit_cnn"
             return
         with self._lock:
             if self._region is None or self._latest_frame is None:
@@ -292,22 +251,8 @@ class XpOcr:
         # CNN용 green_mask 전처리(초록 글씨만 → 세그 깔끔). HP/MP와 동일 기법.
         from .hpmp import _preprocess_for_ocr
         up = _preprocess_for_ocr(crop, upscale=3, thr=20)
-        # 1순위: 숫자 CNN 세그+분류. 빈/실패면 PaddleOCR fallback(원본 3x).
+        # 숫자 CNN 세그+분류 전용 (fallback 없음).
         text = self._cnn_digits(up)
-        if not text:
-            up = cv2.resize(
-                crop, (crop.shape[1] * 3, crop.shape[0] * 3),
-                interpolation=cv2.INTER_CUBIC,
-            )
-            try:
-                out = self._rec.predict(up)
-            except Exception as e:
-                self._last_diag = f"predict err: {e}"
-                self._consecutive_fail += 1
-                if self._consecutive_fail in (1, 5, 20):
-                    self._emit(f"[XP-OCR] predict err: {e}")
-                return
-            text = self._extract_text(out)
         xp = self._parse_int(text)
         # 숫자 CNN 학습 데이터 수집 (env OB_COLLECT_DIGITS=1 일 때만).
         # 파싱 성공한 text 의 숫자열을 라벨 후보로 (박스수 일치 시만 채택).
@@ -383,32 +328,6 @@ class XpOcr:
             return "".join(str(d) for d in labels)
         except Exception:
             return ""
-
-    @staticmethod
-    def _extract_text(out) -> str:
-        """paddleocr 3.x predict 결과 → flat text."""
-        try:
-            if out is None:
-                return ""
-            if isinstance(out, list):
-                parts = []
-                for item in out:
-                    if isinstance(item, dict):
-                        t = item.get("rec_text") or item.get("text") or ""
-                        if t:
-                            parts.append(str(t))
-                    elif isinstance(item, (list, tuple)):
-                        for sub in item:
-                            if isinstance(sub, dict):
-                                t = sub.get("rec_text") or sub.get("text") or ""
-                                if t:
-                                    parts.append(str(t))
-                return " ".join(parts)
-            if isinstance(out, dict):
-                return str(out.get("rec_text") or out.get("text") or "")
-        except Exception:
-            pass
-        return ""
 
     # 옛바 XP 상한: "100억 단위까지" = 최대 999억 (11자리).
     # 1000억 = 10^11 이 cap — 이 값 포함 이상은 무조건 OCR 오탐.

@@ -143,7 +143,7 @@ class Follower:
         # 맵별 "방금 리셋된 상태" 플래그 — 첫 push에 이전 맵 exit_coord 체크용.
         self._fresh_map_guard: dict = {}  # map_name → (exit_coord, expires_ts)
         self._reject_count: dict = {}  # 통계용
-        # MAP-SYNC: 맵 OCR(PaddleOCR CPU, 0.5s throttle)이 좌표 OCR(EasyOCR GPU)보다
+        # MAP-SYNC: 맵 OCR(RapidOCR, 0.5s throttle)이 좌표 OCR(digit_cnn)보다
         # 느려 맵 전환 순간 "좌표는 새 맵 / 맵이름은 이전 맵"인 500~1000ms 창이 생김.
         # 이 창에서 B2:MAPNEQ가 엉뚱한 방향으로 키 hold → 왔다갔다 버그 유발.
         # 해결: 맵 전환 트리거 감지 시 h_map==a_map 될 때까지 키 입력 보류(최대 1.5초).

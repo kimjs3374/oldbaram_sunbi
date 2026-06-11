@@ -1,7 +1,7 @@
 """src_v2.eyes — watchers (background observation).
 
 Each watcher = its own thread, polls a source, updates SnapshotStore + EventBus.
-External libs (EasyOCR/YOLO/mss/numpy) are accessed via injected adapters
+External libs (RapidOCR/YOLO/mss/numpy) are accessed via injected adapters
 so unit tests can run with mocks.
 
 Design ref: §2.4

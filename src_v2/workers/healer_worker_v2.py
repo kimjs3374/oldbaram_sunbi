@@ -64,7 +64,7 @@ class HealerConfig:
     # Eyes poll intervals
     capture_poll_sec: float = 0.02
     yolo_poll_sec: float = 0.05
-    ocr_poll_sec: float = 0.33   # 3Hz — 좌표/맵은 자주 안 바뀜. 기존 20Hz는 EasyOCR GPU 낭비
+    ocr_poll_sec: float = 0.33   # 3Hz — 좌표/맵은 자주 안 바뀜. 과거 고빈도 폴링은 OCR 낭비
     cooldown_poll_sec: float = 1.0
     buff_poll_sec: float = 1.0
     hpmp_poll_sec: float = 0.33  # 3Hz — 자힐/공증 트리거 우선, 0.5s에서 상향

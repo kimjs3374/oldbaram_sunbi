@@ -675,9 +675,7 @@ class HealerWorker(QtCore.QThread):
             # 분리. 메인 루프는 submit(frame) + 최신 latest() 참조 (비블로킹).
             yolo_async = AsyncYolo(yolo)
             self.log.info("[YOLO-ASYNC] 백그라운드 detection 스레드 시작")
-            # 2026-04-21 20:xx: EasyOCR CPU 강제 실험 실패. CPU 에서 coord1
-            # 45ms→742ms 로 악화. GPU 로 복귀. 진짜 원인은 EasyOCR 아니라
-            # 게임(msw.exe) 스킬 렌더링이 GPU 점유해 YOLO 큐 대기.
+            # 좌표=digit_cnn(onnx), 맵=RapidOCR(onnx). torch/paddle/easyocr 0.
             ocr = Ocr(coord_w=cfg.ocr.coord_w, coord_h=cfg.ocr.coord_h,
                       coord_right_pad=cfg.ocr.coord_right_pad,
                       coord_bottom_pad=cfg.ocr.coord_bottom_pad,
@@ -689,17 +687,16 @@ class HealerWorker(QtCore.QThread):
                       gpu=True,
                       map_interval_s=getattr(cfg.ocr,
                                              "map_interval_s", 2.0))
-            _easy_note = getattr(ocr, "_easy_device_note", "unknown")
-            self.log.info(f"[OCR-INIT] EasyOCR={_easy_note}")
+            _coord_note = getattr(ocr, "_coord_device_note", "unknown")
+            self.log.info(f"[OCR-INIT] coord={_coord_note}")
             # [OCR-PROF] 단계별 ms 진단 (2026-04-20 FPS=10 원인).
             # ocr_every_n_frames=10 이라 10회 호출=100프레임≈10초에 1회 로그.
             try:
                 ocr.set_profile_log(lambda s: self.log.info(s), every=10)
             except Exception as _e:
                 self.log.warning(f"[OCR-PROF] set_profile_log 실패: {_e}")
-            # 맵 OCR 백그라운드 워커: PaddleOCR predict(~230ms) 를 별도 스레드로
-            # 분리해 메인 루프 블로킹 제거 (2026-04-20 CUDA 13.1 환경: Paddle
-            # GPU 불가 → 스레드 분리로 fps 회복).
+            # 맵 OCR 백그라운드 워커: RapidOCR(rec-only ~12ms)를 별도 스레드로
+            # 분리해 메인 루프 블로킹 제거.
             try:
                 map_worker = MapOcrWorker(
                     map_w=cfg.ocr.map_w,
@@ -718,11 +715,9 @@ class HealerWorker(QtCore.QThread):
             except Exception as _e:
                 self._map_worker = None
                 self.log.warning(f"[MAP-OCR] worker start 실패 (sync fallback): {_e}")
-            # 2026-04-21: 좌표 OCR (EasyOCR) 도 메인 루프 blocking 이 원인이라
-            # async 래퍼로 분리. submit(frame) 은 비블로킹, latest() 는 최신
-            # OcrResult 반환. 좌표 OCR 885ms spike 가 발생해도 메인 루프는
-            # 계속 돈다. ocr 객체 자체는 그대로 유지 (set_known_maps 등
-            # 내부 state 접근용).
+            # 좌표/맵 OCR 을 async 래퍼로 분리. submit(frame) 은 비블로킹,
+            # latest() 는 최신 OcrResult 반환 → 메인 루프 블로킹 0. ocr 객체
+            # 자체는 그대로 유지 (set_known_maps 등 내부 state 접근용).
             ocr_async = AsyncOcr(ocr)
             self.log.info("[OCR-ASYNC] 백그라운드 좌표/맵 OCR 스레드 시작")
             self.log_msg.emit("OCR 준비 완료")
@@ -1146,9 +1141,8 @@ class HealerWorker(QtCore.QThread):
             # 힐러→격수 쿨다운 보고용 sender (송신 IP=recv src, port=cfg).
             from ..net.udp_sender import UdpSender
             self._udp_out = UdpSender([], 0)  # send_to 단일 송신 전용.
-            # 2026-04-22: OCR 스레드 staggered 시작. 동시에 start 하면
-            # predict 주기가 겹쳐 PaddleX GIL 구간에서 경합 → main thread 기아.
-            # 0.25s 오프셋으로 시작해서 predict 타이밍 분산.
+            # OCR 스레드 staggered 시작. 동시에 start 하면 predict 주기가 겹쳐
+            # GIL 구간 경합 → main thread 기아. 0.25s 오프셋으로 타이밍 분산.
             import time as _time
             try:
                 self._cooldown_ocr.start()
@@ -2168,9 +2162,8 @@ class HealerWorker(QtCore.QThread):
     
                 # --- 쿨다운 OCR + 격수로 역송 (v5) ---
                 # OCR은 별도 스레드에서 돌아감. 메인은 submit_frame(비블로킹)
-                # + latest() 캐시 조회만. (과거 maybe_read 동기 호출이
-                # PaddleOCR.predict 100~500ms 블로킹 → 흰탭 TAB-CONFIRM
-                # 프레임 오염 유발 → 2026-04-17 수정.)
+                # + latest() 캐시 조회만. (과거 maybe_read 동기 호출이 OCR
+                # predict 블로킹 → 흰탭 TAB-CONFIRM 프레임 오염 → 2026-04-17 수정.)
                 try:
                     if self._cooldown_ocr.ready():
                         _mon = getattr(grab, "mon", {}) or {}

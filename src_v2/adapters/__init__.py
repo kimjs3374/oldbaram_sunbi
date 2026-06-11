@@ -8,7 +8,7 @@ Each adapter:
 - Implements the matching v2 Protocol (GrabberAdapter, YoloAdapter, etc.).
 - Translates return shapes to v2 expectations.
 
-If src/* import fails (e.g. test env missing PyQt5/EasyOCR), is_available()
+If src/* import fails (e.g. test env missing PyQt5/RapidOCR), is_available()
 returns False and reads return safe defaults.
 
 Two adapter flavors per module:

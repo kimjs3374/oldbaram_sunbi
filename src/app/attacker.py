@@ -62,8 +62,7 @@ class Attacker:
                         map_left_pad=getattr(cfg.ocr, "map_left_pad", -1),
                         map_upscale=cfg.ocr.map_upscale,
                         gpu=True)
-        # 2026-04-22: AsyncOcr 래퍼 — EasyOCR 스파이크(2271ms 실측) 가 메인
-        # 루프를 블록하지 않도록. 힐러와 동일 패턴 (healer_worker:696).
+        # AsyncOcr 래퍼 — OCR 을 메인 루프에서 떼어 블로킹 0. 힐러와 동일 패턴.
         self._ocr_async = AsyncOcr(self.ocr)
         self.sender = UdpSender(cfg.net.peers, cfg.net.port)
         # 격수 XP OCR (설정 탭에서 경험치 영역 지정 시 활성).
@@ -101,7 +100,7 @@ class Attacker:
         self._f1_window_sec = 5.0
         self._f1_pending_until = 0.0
         # 좌표급변(=맵전환, 워프 거의 없음) 감지 시 맵이름 OCR 갱신까지
-        # map_change_pending 강제 ON → 격수 맵OCR(PaddleOCR) 지연을 좌표(0.01초)로 흡수.
+        # map_change_pending 강제 ON → 격수 맵OCR(RapidOCR) 지연을 좌표(0.01초)로 흡수.
         self._map_chg_until = 0.0
         self._f1_prev_down = False
         # 격수 본인 쿨 OCR — 설정 탭에서 영역/스킬 주입 전까진 inactive.

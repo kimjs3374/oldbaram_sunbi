@@ -12,9 +12,12 @@
 - `test_once(frame, origin)` : 테스트 버튼용 동기 1회 OCR. 원시 텍스트/현재값/
   max/pct 를 dict 로 반환.
 
+인식: 숫자 digit_cnn(onnx) 전용 우선, 빈/실패 시 RapidOCR(rec-only) 보조.
+torch/paddle 의존 0.
+
 전처리:
 - G 채널 - max(R, B) > thr 마스크로 초록 글씨 픽셀만 추출.
-- 반전(글씨=검정, 배경=흰색) + 3x 업스케일 후 PaddleOCR korean mobile rec.
+- 반전(글씨=검정, 배경=흰색) + 3x 업스케일.
 - 숫자만 추출 후 max 값 정보로 '현재/최대' 분리:
     raw 가 str(max) 로 끝나면 앞부분 = current. 아니면 raw 전체 = current.
 - pct = round(current * 100 / max). max ≤ 0 이면 pct = -1.
@@ -31,11 +34,6 @@ from typing import Optional, Tuple
 
 import cv2
 import numpy as np
-
-
-_KOREAN_REC_DIR = pathlib.Path(__file__).resolve().parents[2] / (
-    "models/korean_PP-OCRv5_mobile_rec"
-)
 
 
 @dataclass
@@ -75,7 +73,7 @@ def _preprocess_for_ocr(crop: np.ndarray,
     1) 초록 마스크 (글씨=255, 배경=0)
     2) 반전 (글씨=0 검정, 배경=255 흰)
     3) 3x 업스케일 (INTER_NEAREST 로 얇은 글씨 보존)
-    4) BGR 3채널 복원 (PaddleOCR 입력 형식).
+    4) BGR 3채널 복원 (OCR 입력 형식).
     """
     if crop is None or crop.size == 0:
         return crop
@@ -152,8 +150,8 @@ class HpMpReader:
         self._mp_max: int = 0
         self._rec = None
         # 숫자 CNN (2026-06-10): 좌표 digit_cnn.onnx 재사용. 실측 HP/MP 99%
-        # (자릿수 손실 없음 — PaddleOCR 자릿수 누락/삽입 오독 해결). 세그+분류.
-        # 로드 실패/빈 결과면 아래 _rec(PaddleOCR) fallback.
+        # (자릿수 손실 없음 — 자릿수 누락/삽입 오독 해결). 세그+분류.
+        # 로드 실패/빈 결과면 아래 _rec(RapidOCR rec-only) 보조.
         self._digit_cnn = None
         try:
             from .digit_cnn import DigitCnn
@@ -551,7 +549,7 @@ class HpMpReader:
         if crop is None or crop.size == 0:
             return None, None
         up = _preprocess_for_ocr(crop, upscale=3, thr=20)
-        # 1순위: 숫자 CNN 세그+분류 (자릿수 정확). 빈 결과면 PaddleOCR fallback.
+        # 1순위: 숫자 CNN 세그+분류 (자릿수 정확). 빈 결과면 RapidOCR 보조.
         digits = self._cnn_digits(up)
         if not digits:
             try:

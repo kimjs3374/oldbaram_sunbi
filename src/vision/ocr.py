@@ -1,15 +1,16 @@
-"""좌표/맵이름 OCR. 좌표=EasyOCR(GPU, 숫자), 맵=PaddleOCR TextRecognition(한국어).
+"""좌표/맵이름 OCR — 단일 경량 스택 (torch/paddle 의존 0).
 
-속도 제약 때문에 두 모듈 사용:
-- PaddleOCR CPU 단일 통합 시도했으나 predict 100ms → FPS 7 한계.
-  CUDA 지원 paddle 빌드 없음(compiled_with_cuda=False).
-- 좌표: EasyOCR GPU로 10-20ms.
-- 맵: PaddleOCR(korean_PP-OCRv5_mobile_rec)로 정확도 확보. 0.5s throttle.
+2026-06-11 사용자 지시: PaddleOCR/EasyOCR 완전 제거. 흔적까지 삭제.
+- 좌표 숫자: digit_cnn (onnx ~0.2MB, 해상도 무관, 0~9 분류 CNN).
+- 맵 이름: RapidOCR(korean PP-OCR onnx 13MB, map_rapidocr). 일반 OCR이라
+  숫자 조합 무관 + 한글 base 정확. 맵바 위치 고정 → rec-only 12ms.
 - 맵 crop은 _find_map_bar()로 tight crop → detection 불필요.
-  PP-OCRv5_server_det 캐시 손상 문제 우회 위해 TextRecognition만 사용.
+
 보정 레이어:
 1) 숫자 분할 검증: contour 기반 digit count를 OCR 결과와 교차.
 2) 연속성 필터: 같은 맵에서 Δ > jump_max 면 reject (이전 값 유지).
+3) 맵명 knownmaps 보정: RapidOCR raw 우선 신뢰. known_maps 에 정확일치하면
+   확정, 단일 한글자 OCR 슬립만 보정(_correct_map_name). 과보정 금지.
 """
 import os
 import pathlib
@@ -19,23 +20,10 @@ import time
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
 
-# paddlepaddle onednn 관련 내부 버그 회피 (ConvertPirAttribute2RuntimeAttribute).
-os.environ.setdefault("FLAGS_use_mkldnn", "0")
-# 모델 소스 체크 스킵 (느림 + 오프라인 환경 대비).
-os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
-
 import cv2
 import numpy as np
-from paddleocr import TextRecognition
 
-# 프로젝트 루트 아래 models/에 동봉한 정상 모델을 직접 쓴다.
-# huggingface 자동 다운로드는 xet 경로에서 빈 inference.json을 내려주는 경우가
-# 있어 create_predictor가 parse_error로 실패. 로컬 파일 직지정으로 우회.
 _PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
-_KOREAN_REC_DIR = _PROJECT_ROOT / "models" / "korean_PP-OCRv5_mobile_rec"
-# EasyOCR 모델을 배포에 동봉. 사용자 PC에서 첫 실행 시 인터넷 다운로드 방지.
-# craft_mlt_25k.pth (detection) + english_g2.pth (recognition, 숫자용).
-_EASYOCR_DIR = _PROJECT_ROOT / "models" / "easyocr"
 
 COORD_RE = re.compile(r"(\d{3,4})\D+(\d{3,4})")
 # 맵이름 앞에 들어가는 UI 아이콘/영문 노이즈 제거 (예: "lf) 대방성" → "대방성").
@@ -193,53 +181,6 @@ def _is_ocr_noise(a: str, b: str) -> bool:
     return False
 
 
-def _clean_map_text(s: str) -> str:
-    s = s.strip()
-    s = _MAP_PREFIX_RE.sub("", s)
-    s = _MAP_SUFFIX_RE.sub("", s)
-    # 꼬리 단일 한글자 제거: "선비족입구 예" → "선비족입구".
-    # PaddleOCR이 맵바 옆 UI 글자 1자(예/가/는 등)를 덧붙이는 케이스 대응.
-    # 2자 이상 꼬리는 정상 맵 일부로 간주 유지 ("제2선비족 입구"의 "입구").
-    # 본체(앞부분) 3자 이상일 때만 적용 → 짧은 맵 보호.
-    parts = s.split()
-    if len(parts) >= 2 and len(parts[-1]) == 1:
-        head_len = sum(len(p) for p in parts[:-1])
-        if head_len >= 3:
-            s = " ".join(parts[:-1])
-    s = s.strip()
-    # 괄호 밸런스 복원: OCR이 끝 ')' 자주 탈락 → 격수/힐러 간 lap suffix 불일치.
-    # 예) 격수 '선비족2-4(1)' vs 힐러 '선비족2-4(1' → trail 키 영구 미스매치.
-    # '(' 개수 > ')' 개수면 부족한 만큼 뒤에 ')' 보충.
-    # 반대(고립 ')')는 노이즈로 간주 끝에서만 제거.
-    # 옛바 맵이름에 중첩 괄호 없음 → 단순 카운트로 충분.
-    open_n = s.count('(')
-    close_n = s.count(')')
-    if open_n > close_n:
-        s = s + ')' * (open_n - close_n)
-    elif close_n > open_n:
-        # 뒤쪽 연속 ')' 에서 초과분만큼만 제거 (정상 lap suffix 보존).
-        m = re.search(r'\)+$', s)
-        if m:
-            excess = close_n - open_n
-            tail_len = len(m.group(0))
-            keep = max(0, tail_len - excess)
-            s = s[:m.start()] + ')' * keep
-    return s
-
-
-def _map_similar(a: str, b: str) -> bool:
-    """OCR 흔들림 허용 비교. 공통 글자 비율 >= 60%면 같은 맵으로 간주."""
-    if not a or not b:
-        return False
-    if a == b:
-        return True
-    sa, sb = set(a), set(b)
-    longer = max(len(sa), len(sb))
-    if longer == 0:
-        return False
-    return len(sa & sb) / longer >= 0.6
-
-
 @dataclass
 class OcrResult:
     coord: Optional[Tuple[int, int]]  # (x, y) 또는 None
@@ -304,8 +245,8 @@ class Ocr:
         # 근거: 같은맵 정상 이동 0~8칸(2016건)/21칸+ 전환(72건). 20이면 안전 분리.
         self.map_change_coord_hint = map_change_coord_hint
         self._reject_count = 0
-        # 맵 OCR 스로틀: paddleocr가 40~100ms 튀어 루프 FPS를 깎으므로
-        # 이 간격 안이면 이전 raw 텍스트 재사용. 맵 전환은 초 단위라 충분.
+        # 맵 OCR 스로틀: RapidOCR rec-only 는 ~12ms 로 가볍지만 맵 전환은 초
+        # 단위라 이 간격 안이면 이전 raw 텍스트 재사용 (불필요한 호출 절감).
         self.map_interval_s = map_interval_s
         self._last_map_t = 0.0
         self._last_raw_map: str = ""
@@ -326,61 +267,20 @@ class Ocr:
         # v5.17: DEFAULT_KNOWN_MAPS 로 seed. PP-OCRv5 mobile 한글 희귀자 탈락
         # ("흉"→공백) 방어. set_known_maps 는 DEFAULT 와 union 하여 유지.
         self._known_maps: set = set(DEFAULT_KNOWN_MAPS)
-        # 좌표: EasyOCR. 2026-04-21 GPU 경합으로 9ms→800ms 로 튀는 현상 →
-        # healer_worker 에서 gpu=False 로 CPU 강제 가능.
-        # 진단 로그에 실제 device 명시 (사용자 복사 반영 여부 검증용).
-        # 좌표 인식: 경량 CNN(digit_cnn.onnx) 우선. 있으면 EasyOCR(PyTorch)
-        # 미로딩 → torch 회피 + 해상도 무관(augment 학습). 없으면 fallback.
+        # 좌표 인식: 경량 CNN(digit_cnn.onnx). 해상도 무관(augment 학습),
+        # torch 불필요(onnxruntime CPU). PaddleOCR/EasyOCR 완전 제거됨.
         from .digit_cnn import DigitCnn
         _cnn_path = (pathlib.Path(__file__).resolve().parent
                      / "digit_cnn.onnx")
         self._digit_cnn = DigitCnn(_cnn_path)
         self._use_coord_cnn = self._digit_cnn.ready()
-        self._easy_gpu = bool(gpu)
-        if self._use_coord_cnn:
-            self.digit = None
-            self._easy_device_note = "cnn-onnx(no-torch)"
-        else:
-            import easyocr
-            easy_kwargs = dict(gpu=gpu, verbose=False)
-            if _EASYOCR_DIR.is_dir() and (_EASYOCR_DIR / "craft_mlt_25k.pth").exists():
-                easy_kwargs["model_storage_directory"] = str(_EASYOCR_DIR)
-                easy_kwargs["download_enabled"] = False
-            self.digit = easyocr.Reader(["en"], **easy_kwargs)
-            self._easy_device_note = (
-                "GPU" if bool(gpu) else "CPU(forced)"
-            )
-        # 맵: PaddleOCR korean recognition. tight crop이라 detection 불필요.
-        # 2026-04-21: CPU 강제. GPU 는 YOLO 전용.
-        map_kwargs = dict(
-            model_name="korean_PP-OCRv5_mobile_rec",
-            enable_mkldnn=False,
-        )
-        if _KOREAN_REC_DIR.is_dir():
-            map_kwargs["model_dir"] = str(_KOREAN_REC_DIR)
-        self.map = None
-        for _extra in [{"device": "cpu"}, {"use_gpu": False}, {}]:
-            try:
-                self.map = TextRecognition(**_extra, **map_kwargs)
-                break
-            except Exception:
-                continue
-        if self.map is None:
-            self.map = TextRecognition(**map_kwargs)
-        # warmup
-        if self.digit is not None:
-            self.digit.readtext(np.zeros((60, 400, 3), dtype=np.uint8),
-                                allowlist="0123456789 ", detail=0)
-        list(self.map.predict(np.zeros((48, 320, 3), dtype=np.uint8)))
-        # 2026-06-11 CRNN 임시 비활성: 통째 암기(과적합)라 학습외 숫자 조합 못읽음.
-        # 숫자 char digit_cnn 재설계 전까지 PaddleOCR 사용. 영구 None.
-        self.map_crnn = None
+        self._coord_device_note = "digit_cnn-onnx(no-torch)"
         # 맵 OCR 비동기 워커 (선택). attach_map_worker 로 붙이면 read() 의
-        # 맵 블록이 비블로킹으로 전환 (메인 루프에서 PaddleOCR predict 를
+        # 맵 블록이 비블로킹으로 전환 (메인 루프에서 RapidOCR predict 를
         # 호출하지 않음). sync fallback 은 _async_map is None 일 때 유지.
         self._async_map = None  # Optional[MapOcrWorker]
-        # 프로파일: 매 read() 호출 분해 로그 (2026-04-20 FPS 10 원인 진단).
-        # coord(EasyOCR) 1차 + retry N회 + map(PaddleOCR) 각 ms.
+        # 프로파일: 매 read() 호출 분해 로그.
+        # coord(digit_cnn) 1차 + retry N회 + map(RapidOCR) 각 ms.
         self._prof_log_fn = None
         self._prof_every = 10   # N번 호출당 1회 로그 (10 FPS 기준 10초에 1회).
         self._prof_tick = 0
@@ -389,7 +289,7 @@ class Ocr:
         """맵 OCR 을 비동기 워커로 위임. worker 는 MapOcrWorker 인스턴스.
 
         설정 후 read() 는 워커에 frame 을 submit 하고 latest() 로 최근 결과만
-        폴링. 메인 루프에서 PaddleOCR predict 호출 없음 (블로킹 0).
+        폴링. 메인 루프에서 RapidOCR predict 호출 없음 (블로킹 0).
         """
         self._async_map = worker
 
@@ -647,9 +547,8 @@ class Ocr:
             c = img[y1:y1 + self.map_h, x1:x1 + self.map_w]
         if c.size == 0:
             c = img[0:40, 0:400]
-        # PaddleOCR은 원본 BGR이 가장 정확. 이진화는 "방"→"발" 같은 획 손상 유발.
-        # 단, 컴팩트 게임창(격수 PC)에서 bar height < 48px 이면 PP-OCRv5 mobile
-        # rec 권장(48px) 미달로 복잡획 글자 탈락("흉"→공백, 2026-04-20 실측).
+        # RapidOCR 도 원본 BGR이 가장 정확(이진화는 획 손상 유발). 단, 컴팩트
+        # 게임창(격수 PC)에서 bar height < 48px 이면 복잡획 글자 탈락 가능 →
         # LANCZOS4 업스케일 + unsharp mask 로 획 보존. 큰 창(힐러 PC)에선 no-op.
         try:
             h0 = int(c.shape[0])
@@ -669,49 +568,7 @@ class Ocr:
                     pass
         except Exception:
             pass
-        # 2026-06-11: 무차별 20프레임 저장 폐기 → CRNN conf<0.5(미학습/새맵)일
-        # 때만 _save_collect_crop 으로 수집. 학습된 맵 중복 수집 제거.
         return c
-
-    def _save_collect_crop(self, crop) -> None:
-        """미학습/저신뢰 맵 crop 수집 (logs/map_crops/). throttle 1.5s.
-
-        학습된 맵은 CRNN conf 높아 호출 안 됨 → 새 맵/불확실만 모인다.
-        종료 시 cloud_map_upload 가 자동 업로드(main_window.closeEvent).
-        """
-        now = time.monotonic()
-        if now - getattr(self, "_last_collect_ts", 0.0) < 1.5:
-            return
-        self._last_collect_ts = now
-        try:
-            d = _PROJECT_ROOT / "logs" / "map_crops"
-            d.mkdir(parents=True, exist_ok=True)
-            n = getattr(self, "_collect_n", 0) + 1
-            self._collect_n = n
-            fn = f"{time.strftime('%H%M%S')}_c{n:04d}.png"
-            cv2.imwrite(str(d / fn), crop)
-        except Exception:
-            pass
-
-    @staticmethod
-    def _extract_texts(preds) -> List[str]:
-        """PaddleOCR TextRecognition 결과에서 rec_text 문자열만 뽑기."""
-        out: List[str] = []
-        for r in preds:
-            texts = None
-            if hasattr(r, "get"):
-                texts = r.get("rec_texts")
-                if texts is None:
-                    t = r.get("rec_text")
-                    texts = [t] if t else []
-            if not texts:
-                try:
-                    t = r["rec_text"]
-                    texts = [t] if t else []
-                except Exception:
-                    texts = []
-            out.extend([x for x in texts if x])
-        return out
 
     def _read_digits_cnn(self, cc) -> Tuple[str, str]:
         """좌표 숫자를 경량 CNN으로 인식 (해상도 무관, torch 불필요, 배치).
@@ -724,51 +581,9 @@ class Ocr:
         s = "".join(str(d) for d in labels)
         return s, s
 
-    def _read_digits_template(self, cc) -> Tuple[str, str]:
-        """좌표 숫자를 템플릿 매칭으로 인식 (EasyOCR 대체, ~1ms, torch 불필요).
-
-        _segment_digit_boxes 로 숫자 분리 → 각 박스를 0~9 템플릿과 SSD 매칭.
-        """
-        boxes = _segment_digit_boxes(cc)  # x순 정렬
-        out = []
-        for (x, y, w, h) in boxes:
-            patch = cc[y:y + h, x:x + w]
-            d = self._coord_matcher.match(patch)
-            if d is not None:
-                out.append(str(d))
-        s = "".join(out)
-        return s, s
-
     def _read_digits(self, cc) -> Tuple[str, str]:
-        """EasyOCR 숫자 읽기. (raw_text, digits_only).
-
-        readtext = detection(CRAFT) + recognition 2단 풀 파이프라인.
-        좌표 crop은 이미 tight 하므로 detection 재실행 불필요. 그런데도
-        readtext 쓰면 CRAFT가 랜덤하게 150-260ms 튀는 스파이크 발생
-        (실측 2026-04-20 힐러1.txt: coord1=173.7/262.2ms 스파이크).
-        recognize() 에 horizontal_list 로 전체 박스 지정해 detection 스킵
-        → 평상 속도가 곧 최악 속도 (수십 ms 내).
-        EasyOCR API 변경 대비 readtext fallback.
-        """
-        if getattr(self, "_use_coord_cnn", False):
-            return self._read_digits_cnn(cc)
-        try:
-            H, W = cc.shape[:2]
-            gray = cv2.cvtColor(cc, cv2.COLOR_BGR2GRAY) if cc.ndim == 3 else cc
-            ct = self.digit.recognize(
-                gray,
-                horizontal_list=[[0, W, 0, H]],
-                free_list=[],
-                allowlist="0123456789 ",
-                detail=0,
-                paragraph=False,
-            )
-        except Exception:
-            ct = self.digit.readtext(cc, allowlist="0123456789 ",
-                                     detail=0, paragraph=False)
-        raw = " ".join(ct) if ct else ""
-        digits = re.sub(r"\D", "", raw)
-        return raw, digits
+        """좌표 숫자 읽기 → (raw_text, digits_only). digit_cnn 전용."""
+        return self._read_digits_cnn(cc)
 
     def _filter_coord_jump(self, coord, cmp_m):
         """같은맵 좌표 점프 필터 — 축별 독립 클램프.
@@ -895,6 +710,31 @@ class Ocr:
             raw_m = self._last_map
         return raw_m
 
+    def _correct_map_name(self, raw: str) -> str:
+        """맵명 knownmaps 보정 — 보수적(과보정 금지).
+
+        설계 (2026-06-11 사용자 지시): RapidOCR raw 는 ~100% 정확하고 숫자 조합
+        무관이라 base 를 통째로 바꾸는 옛 PaddleOCR 시절 canonical 교정은 오히려
+        오보정('선비족1방'→'선비족입구')을 냈다. 그래서 여기선:
+
+          1) raw 가 known_maps 에 **정확일치** → 그대로 확정.
+          2) known_maps 중 raw 와 **단일 한글자 OCR 슬립**(_is_ocr_noise: 같은
+             길이 1글자 치환 또는 한글/하이픈/공백 1자 ins/del) 인 후보가
+             **정확히 1개**면 그쪽으로 교정. (예: '선미족2-4'→'선비족2-4')
+          3) 그 외(애매/다중후보/먼 거리) → raw 신뢰. 절대 추측 교체 안 함.
+
+        known_maps 가 비면(standalone) raw 그대로. known_maps 는 격수 UDP +
+        knownmaps.txt + 런타임 자동학습으로 채워진 신뢰 정답집합.
+        """
+        if not raw or not self._known_maps:
+            return raw
+        if raw in self._known_maps:
+            return raw
+        cands = [k for k in self._known_maps if _is_ocr_noise(raw, k)]
+        if len(cands) == 1:
+            return cands[0]
+        return raw
+
     def read(self, frame: np.ndarray) -> OcrResult:
         # 방어: 좌표 OCR은 밝기/오버레이 간섭에 민감 → 1차 실패 시 다른 threshold로
         # 자동 재시도. 자릿수 많은 쪽 채택. (실측: (58,34) 고착 재현 방지)
@@ -958,7 +798,9 @@ class Ocr:
             if worker_ts > self._last_map_t:
                 _prof_map_hit = True
                 _prof_map_ms = worker_cycle
-                raw_m = _clean_map_text(worker_raw)
+                # 워커가 map_rapidocr 로 노이즈제거+구조정규화한 raw. 아래
+                # _correct_map_name 이 knownmaps 보정만 추가.
+                raw_m = worker_raw
                 self._last_raw_map = raw_m
                 self._last_map_t = worker_ts
             else:
@@ -970,8 +812,9 @@ class Ocr:
                 _prof_map_hit = True
                 _prof_t_m0 = time.perf_counter()
                 mc = self._crop_map(frame)
-                # RapidOCR(korean) 우선 (한글+숫자 ~100%, 조합무관). 빈값이면
-                # PaddleOCR fallback.
+                # 맵=RapidOCR(korean) 전용. 일반 OCR이라 숫자 조합무관 + 한글
+                # base 정확. fallback 없음. map_rapidocr 가 노이즈 제거 + X-Y(Z)
+                # 구조 정규화까지 완료한 raw 반환 → knownmaps 보정은 아래 _correct.
                 _raw = ""
                 try:
                     from .map_rapidocr import read_map as _rmap, ready as _rr
@@ -979,49 +822,24 @@ class Ocr:
                         _raw = _rmap(mc)
                 except Exception:
                     _raw = ""
-                if not _raw:
-                    _raw = " ".join(self._extract_texts(self.map.predict(mc)))
                 _prof_map_ms = (time.perf_counter() - _prof_t_m0) * 1000
-                raw_m = _clean_map_text(_raw)
+                raw_m = _raw
                 self._last_raw_map = raw_m
                 self._last_map_t = now
             else:
                 raw_m = self._last_raw_map
         # 디버그용: pending 로직 적용 전 원본 fresh OCR. attacker/healer 로그로 노출.
         raw_m_fresh = raw_m
-        # 맵 전환 판정: _clean_map_text가 꼬리 단일 한글자 노이즈를 이미 제거.
-        # 남은 접두사 확장(예: "대방성" → "대방성입구")은 진짜 전환으로 간주,
-        # pending 메커니즘으로 1프레임 확인 후 교체.
+        # 맵 전환 판정: map_rapidocr 가 노이즈 제거 + X-Y(Z) 구조 정규화 완료.
+        # 접두사 확장(예: "대방성" → "대방성입구")은 진짜 전환으로 간주.
         if raw_m:
-            # 2026-04-23 knownmaps.txt 기반 canonical 복원 (v5.18).
-            # user base 사전으로 raw_m의 base 부분 복구. suffix(5-5, (1), 입구 등)
-            # 와 무관하게 base edit-dist-1 매칭으로 canonical 강제.
-            # attacker/healer OCR이 같은 글자(흉) 동시 탈락 케이스도 이 층에서 교정.
-            if _USER_KNOWN_BASES:
-                canon = _canonicalize_via_user_bases(raw_m)
-                if canon and canon != raw_m:
-                    raw_m = canon
-            # v5.16: 격수 known_maps 우선 canonical 교정.
-            # raw_m이 known_maps에 없고, known_maps 중 raw_m의 "한글자 누락본"
-            # 관계(=_is_ocr_noise True)인 더 긴 후보가 있으면 즉시 치환.
-            # 맵 전환 첫 프레임부터 h_map = canonical 보장 → no_trail 고착 원천 차단.
-            # v5.15는 정상 OCR이 "이후에" 와야 self-heal이었지만 OCR이 영구
-            # 글자 누락하는 케이스(11:17:58 실증)에선 발동 못 함.
-            if self._known_maps and raw_m not in self._known_maps:
-                # v5.17: 같은 길이 치환('흡'↔'흉' 등)도 처리. 길이 무관하게
-                # _is_ocr_noise (편집거리 ≤1) 후보를 찾고, 긴 쪽 우선 + 동률은
-                # 첫 매칭. OCR 원문 어떤 형태든 격수 known_maps 이름으로 강제
-                # 귀속. 2026-04-20 '제4흡노족1' → '제4흉노족1' 실증.
-                best = ""
-                for km in self._known_maps:
-                    if _is_ocr_noise(raw_m, km):
-                        if len(km) > len(best) or not best:
-                            best = km
-                if best:
-                    raw_m = best
-            raw_m = self._gate_map_name(raw_m)
-        # 좌표 파싱: EasyOCR이 "0076"을 "007 6"처럼 공백 삽입하는 케이스 있어
-        # regex 단독으론 마지막 자리 손실. contour 개수로 직접 분할.
+            # 맵명 보정 (2026-06-11): RapidOCR raw 우선 신뢰. known_maps 정확일치
+            # → 확정. 단일 한글자 OCR 슬립만 보정(과보정 금지). map_rapidocr 가
+            # 노이즈 제거 + X-Y(Z) 구조 정규화(괄호밸런스) 완료한 상태로 들어옴.
+            raw_m = self._correct_map_name(raw_m)
+            self._last_map = raw_m
+        # 좌표 파싱: contour 분할로 좌(x)/우(y) 자릿수를 직접 나눠 마지막 자리
+        # 손실 방지(regex 단독은 공백 삽입 시 끝자리 누락).
         coord: Optional[Tuple[int, int]] = None
         boxes = _segment_digit_boxes(cc)
         n_x, n_y = _split_two_groups(boxes)
@@ -1075,7 +893,7 @@ class Ocr:
         if coord is not None:
             self._last_coord = coord
         # [OCR-PROF] 단계별 ms: every 호출마다 1회 로그.
-        # coord1=EasyOCR 1차, retry=재시도 N회+총ms, map=PaddleOCR (스킵 가능).
+        # coord1=digit_cnn 1차, retry=재시도 N회+총ms, map=RapidOCR (스킵 가능).
         try:
             if self._prof_log_fn is not None:
                 self._prof_tick += 1
@@ -1103,9 +921,8 @@ class Ocr:
 class AsyncOcr:
     """Ocr 를 백그라운드 스레드로 감쌈.
 
-    2026-04-21: EasyOCR 좌표 OCR 이 9ms → 885ms 로 튀어 메인 루프를 직접
-    블로킹 → FPS 27 → 5 로 급락. AsyncOcr 는 메인 루프를 차단하지 않고
-    백그라운드에서 read() 를 돌려 FPS 를 고정한다.
+    OCR(좌표 digit_cnn + 맵 RapidOCR)을 메인 루프에서 떼어 백그라운드
+    스레드에서 read() 를 돌려 FPS 를 고정한다 (메인 블로킹 0).
     - submit(frame): 최신 frame 덮어쓰기 (큐 쌓지 않음).
     - latest(): 마지막 OcrResult 반환 (없으면 None).
     - known_maps / profile_log 는 래퍼가 위임.

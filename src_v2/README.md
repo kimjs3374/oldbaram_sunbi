@@ -25,7 +25,7 @@ src_v2/
 
 ## 즉시 검증 방법
 
-테스트는 외부 라이브러리(EasyOCR, ultralytics, mss, PyQt) **없이도 통과**합니다. 모든 외부 의존은 adapter로 분리되었고 테스트는 mock adapter로 self-verifiable.
+테스트는 외부 라이브러리(RapidOCR, ultralytics, mss, PyQt) **없이도 통과**합니다. 모든 외부 의존은 adapter로 분리되었고 테스트는 mock adapter로 self-verifiable.
 
 ```bash
 cd D:\oldbaram

@@ -39,9 +39,9 @@ class OcrCfg:
     map_left_pad: int = -1
     map_upscale: int = 3
     ocr_every_n_frames: int = 10
-    # 맵 이름 OCR 스로틀 (초). PaddleOCR korean(CPU) 호출이 ~230ms 걸림.
+    # 맵 이름 OCR 스로틀 (초). RapidOCR rec-only(~12ms)지만 맵 전환은 초 단위.
     # ocr.read() 호출 주기(매 ocr_every_n_frames 프레임)보다 크게 잡아야
-    # 매 호출마다 PaddleOCR 재실행을 막을 수 있음.
+    # 매 호출마다 OCR 재실행을 막을 수 있음.
     # 2026-04-22: 맵 전환 지연으로 좌표-맵 불일치 창 길어짐 → 2.0s→0.5s (초당 2회).
     map_interval_s: float = 0.5
 

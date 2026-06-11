@@ -2,7 +2,7 @@
 
 좌표 CNN(digit_cnn.onnx)을 HP/MP/XP로 확장하기 위한 실게임 patch 수집기.
 좌표 _collect_digits.py 와 동일 철학: 각 영역 전처리 이미지에서 숫자 박스를
-세그 분할 + (PaddleOCR 자릿수와 일치 시) 라벨링해 logs/digit_collect/{label}/
+세그 분할 + (인식 자릿수와 일치 시) 라벨링해 logs/digit_collect/{label}/
 에 patch 저장. 라벨 불확실(박스수≠자릿수, 예: HP 슬래시 포함)이면 전체 crop을
 _raw/{src}/ 에 저장 — 폰트가 좌표 숫자와 동일한지 육안 확인용.
 
@@ -49,7 +49,7 @@ def collect(src: str, proc_bgr, label_digits) -> None:
 
     src: 'hp'|'mp'|'xp' (파일명 prefix).
     proc_bgr: OCR에 넣는 전처리 BGR 이미지(좌표 _crop_coord / hpmp _preprocess_for_ocr).
-    label_digits: 같은 프레임 PaddleOCR 결과 숫자열(라벨 후보). 박스수와 길이가
+    label_digits: 같은 프레임 OCR 결과 숫자열(라벨 후보). 박스수와 길이가
                   일치할 때만 박스별 라벨로 채택.
     """
     if not _ENABLED or proc_bgr is None or getattr(proc_bgr, "size", 0) == 0:
