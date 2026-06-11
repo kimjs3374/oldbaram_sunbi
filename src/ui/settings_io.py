@@ -84,6 +84,17 @@ def collect(mw) -> dict:
         "overlay_on": mw.chk_overlay.isChecked(),
         "overlay_opacity": int(mw.slider_overlay_opacity.value())
             if hasattr(mw, "slider_overlay_opacity") else 90,
+        # 오버레이 종류별 표시 (2026-06-12 OverlayDialog).
+        "overlay_kinds": (
+            {k: bool(c.isChecked())
+             for k, c in mw.overlay_kind_chks.items()}
+            if hasattr(mw, "overlay_kind_chks") else {}
+        ),
+        # 선비족 네비 (2026-06-12).
+        "cave_order_text": mw.cave_order_edit.text()
+            if hasattr(mw, "cave_order_edit") else "",
+        "cave_x_override": int(mw.spin_cave_x.value())
+            if hasattr(mw, "spin_cave_x") else 0,
         # 스킬범위 오버레이 (격수 전용).
         "skill_range_on": bool(mw.chk_skill_range.isChecked())
             if hasattr(mw, "chk_skill_range") else False,
@@ -418,6 +429,31 @@ def load(mw):
             mw.lbl_overlay_opacity.setText(f"{iv}%")
         except Exception:
             pass
+    # 오버레이 종류별 표시 복원 (2026-06-12) — overlay_on 강제 ON 보다 먼저
+    # (ON 시그널이 종류 체크 상태를 읽어 show 하므로 선복원 필수).
+    ok_v = g("overlay_kinds")
+    if isinstance(ok_v, dict) and hasattr(mw, "overlay_kind_chks"):
+        for _k, _c in mw.overlay_kind_chks.items():
+            if _k in ok_v:
+                try:
+                    _c.blockSignals(True)
+                    _c.setChecked(bool(ok_v[_k]))
+                finally:
+                    _c.blockSignals(False)
+    # 선비족 네비 복원 (시그널 차단 — 워커 미기동 상태라 echo 불필요).
+    try:
+        if g("cave_x_override") is not None and hasattr(mw, "spin_cave_x"):
+            mw.spin_cave_x.blockSignals(True)
+            mw.spin_cave_x.setValue(int(g("cave_x_override")))
+            mw.spin_cave_x.blockSignals(False)
+        if g("cave_order_text") is not None and hasattr(mw, "cave_order_edit"):
+            mw._cave_order_programmatic = True
+            try:
+                mw.cave_order_edit.setText(str(g("cave_order_text")))
+            finally:
+                mw._cave_order_programmatic = False
+    except Exception:
+        pass
     # Overlay 토글: 저장값 무시, 항상 강제 ON 으로 시작.
     # 사용자 요청: UI 재시작 시 오버레이 자동 활성화 보장.
     # chk_overlay 기본값은 unchecked 이므로 setChecked(True) 는 반드시

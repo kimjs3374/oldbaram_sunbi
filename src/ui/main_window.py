@@ -63,6 +63,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # 사냥 분석/맵 히스토리 오버레이 (2026-06-12 GameOverlay에서 분리).
         # 격수 모드 전용, 위치 키 "hunt".
         self._hunt_overlay = None  # type: Optional[HuntOverlay]
+        # 선비족 굴 순서 네비게이션 오버레이 (2026-06-12). 위치 키 "huntnav".
+        self._hunt_nav_overlay = None  # type: Optional["HuntNavOverlay"]
         # 알림 edge 트리거 상태 (힐러별 직전 remaining 초).
         self._alert_prev: dict[int, dict] = {}
         # 힐러별 마지막 event_seq. 새 이벤트 수신 감지용.
@@ -517,45 +519,57 @@ class MainWindow(QtWidgets.QMainWindow):
         all_container = QtWidgets.QWidget()
         all_container.setLayout(all_row)
         self.attacker_panel_layout.addWidget(all_container)
-        # 오버레이 토글 행 (별도 라인).
-        ov_row = QtWidgets.QHBoxLayout()
-        ov_row.setSpacing(6)
-        self.chk_overlay = QtWidgets.QCheckBox("오버레이")
-        self.chk_overlay.setToolTip(
-            "게임 화면 위에 힐러 쿨다운 + 스킬 임박 알림 띄우기 (msw 위)."
-        )
+        # 오버레이 설정 — 별도 윈도우(OverlayDialog)로 분리 (2026-06-12).
+        # 체크된 오버레이만 표시 + 위치편집 + 투명도. 위젯은 다이얼로그가
+        # 생성, main_window 는 alias 참조 + 시그널 연결 (SkillRangeDialog 패턴).
+        from .dialogs import OverlayDialog
+        self.overlay_dlg = OverlayDialog(self)
+        self.chk_overlay = self.overlay_dlg.chk_overlay
+        self.chk_overlay_edit = self.overlay_dlg.chk_overlay_edit
+        self.slider_overlay_opacity = self.overlay_dlg.slider_overlay_opacity
+        self.lbl_overlay_opacity = self.overlay_dlg.lbl_overlay_opacity
+        self.overlay_kind_chks = self.overlay_dlg.kind_chks
         self.chk_overlay.stateChanged.connect(self._on_toggle_overlay)
-        self.chk_overlay_edit = QtWidgets.QCheckBox("위치 편집")
-        self.chk_overlay_edit.setToolTip(
-            "체크 시 오버레이에 마우스 입력 받아 드래그로 위치 이동 가능. "
-            "해제하면 입력 통과(클릭 무시) 모드로 복귀."
-        )
         self.chk_overlay_edit.stateChanged.connect(
             self._on_toggle_overlay_edit
         )
-        ov_row.addWidget(self.chk_overlay)
-        ov_row.addWidget(self.chk_overlay_edit)
-        ov_row.addSpacing(12)
-        # 투명도 슬라이더: 10~100% (0.1~1.0). 기본 90%.
-        ov_row.addWidget(QtWidgets.QLabel("투명도"))
-        self.slider_overlay_opacity = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.slider_overlay_opacity.setMinimum(10)
-        self.slider_overlay_opacity.setMaximum(100)
-        self.slider_overlay_opacity.setSingleStep(5)
-        self.slider_overlay_opacity.setPageStep(10)
-        self.slider_overlay_opacity.setValue(90)
-        self.slider_overlay_opacity.setFixedWidth(120)
-        self.slider_overlay_opacity.setToolTip(
-            "오버레이 창 전체 투명도 (30% ~ 100%). 값이 낮을수록 투명."
-        )
-        self.lbl_overlay_opacity = QtWidgets.QLabel("90%")
-        self.lbl_overlay_opacity.setFixedWidth(36)
         self.slider_overlay_opacity.valueChanged.connect(
             self._on_overlay_opacity_changed
         )
-        ov_row.addWidget(self.slider_overlay_opacity)
-        ov_row.addWidget(self.lbl_overlay_opacity)
-        ov_row.addStretch(1)
+        for _k, _c in self.overlay_kind_chks.items():
+            _c.stateChanged.connect(
+                lambda st, k=_k: self._on_overlay_kind_changed(k, st)
+            )
+        ov_row = QtWidgets.QHBoxLayout()
+        ov_row.setSpacing(6)
+        self.btn_overlay_cfg = QtWidgets.QPushButton("오버레이…")
+        self.btn_overlay_cfg.setToolTip(
+            "오버레이 설정 창 열기 — 표시할 오버레이 선택 + 위치 편집 + 투명도."
+        )
+        self.btn_overlay_cfg.clicked.connect(self._open_overlay_dialog)
+        ov_row.addWidget(self.btn_overlay_cfg)
+        # 선비족 네비 입력 (격수 전용): x 수동(0=자동) + 굴 순서.
+        ov_row.addSpacing(10)
+        ov_row.addWidget(QtWidgets.QLabel("네비 x"))
+        self.spin_cave_x = QtWidgets.QSpinBox()
+        self.spin_cave_x.setRange(0, 5)
+        self.spin_cave_x.setValue(0)
+        self.spin_cave_x.setToolTip("선비족 지역 x 수동 지정 (0=맵 OCR 자동)")
+        self.spin_cave_x.valueChanged.connect(self._on_cave_x_changed)
+        ov_row.addWidget(self.spin_cave_x)
+        ov_row.addWidget(QtWidgets.QLabel("굴 순서"))
+        self.cave_order_edit = QtWidgets.QLineEdit()
+        self.cave_order_edit.setPlaceholderText("예: 5,4,3,2 — 비우면 자동 학습")
+        self.cave_order_edit.setToolTip(
+            "굴(y) 사냥 순서. 직접 입력=수동 고정, 비우면 실주행 학습.\n"
+            "학습 확정 시 자동으로 채워짐 (동작 중 수정 즉시 반영)."
+        )
+        self.cave_order_edit.textChanged.connect(self._on_cave_order_changed)
+        # 자동입력(프로그램) vs 사용자 수정 구분 플래그.
+        self._cave_order_programmatic = False
+        self._cave_order_last_auto = ""
+        self._hunt_nav_notice_seq = 0
+        ov_row.addWidget(self.cave_order_edit, 1)
         ov_container = QtWidgets.QWidget()
         ov_container.setLayout(ov_row)
         self.attacker_panel_layout.addWidget(ov_container)
@@ -1039,39 +1053,27 @@ class MainWindow(QtWidgets.QMainWindow):
         # 도적/전사 서브클래스 선택 — 격수일 때만.
         if hasattr(self, "subclass_container"):
             self.subclass_container.setVisible(not is_healer)
-        # 사냥 도우미 오버레이 — 격수 모드 + 오버레이 ON일 때만 show.
+        # 격수 전용 오버레이 4종 — 격수 모드 + 마스터 ON + 종류 체크 시만 show.
+        # (마스터 판단은 chk_overlay 기준 — cd 종류가 꺼져 있어도 동작하게.)
         try:
-            if self._helper_overlay is not None:
-                want = (not is_healer) and (self._overlay is not None
-                                            and self._overlay.isVisible())
-                if want and not self._helper_overlay.isVisible():
-                    self._helper_overlay.show()
-                elif (not want) and self._helper_overlay.isVisible():
-                    self._helper_overlay.hide()
+            _master_on = bool(self.chk_overlay.isChecked())
         except Exception:
-            pass
-        # 힐러 HP/MP 오버레이 — 격수 모드 + 오버레이 ON일 때만 show.
-        try:
-            if self._hpmp_overlay is not None:
-                want = (not is_healer) and (self._overlay is not None
-                                            and self._overlay.isVisible())
-                if want and not self._hpmp_overlay.isVisible():
-                    self._hpmp_overlay.show()
-                elif (not want) and self._hpmp_overlay.isVisible():
-                    self._hpmp_overlay.hide()
-        except Exception:
-            pass
-        # 사냥 분석/맵 히스토리 오버레이 — 격수 모드 + 오버레이 ON일 때만 show.
-        try:
-            if self._hunt_overlay is not None:
-                want = (not is_healer) and (self._overlay is not None
-                                            and self._overlay.isVisible())
-                if want and not self._hunt_overlay.isVisible():
-                    self._hunt_overlay.show()
-                elif (not want) and self._hunt_overlay.isVisible():
-                    self._hunt_overlay.hide()
-        except Exception:
-            pass
+            _master_on = False
+        for _k, _ov in (("helper", self._helper_overlay),
+                        ("hpmp", self._hpmp_overlay),
+                        ("hunt", self._hunt_overlay),
+                        ("huntnav", self._hunt_nav_overlay)):
+            try:
+                if _ov is None:
+                    continue
+                want = ((not is_healer) and _master_on
+                        and self._overlay_kind_on(_k))
+                if want and not _ov.isVisible():
+                    _ov.show()
+                elif (not want) and _ov.isVisible():
+                    _ov.hide()
+            except Exception:
+                pass
         # 스킬범위 오버레이 — 격수 모드 + 체크박스 ON일 때만 show.
         try:
             if self._skill_range_overlay is not None:
@@ -1766,6 +1768,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._hunt_overlay.position_changed.connect(
                     lambda x, y: self._on_overlay_pos_changed("hunt", x, y)
                 )
+            if self._hunt_nav_overlay is None:
+                from .hunt_nav_overlay import HuntNavOverlay
+                self._hunt_nav_overlay = HuntNavOverlay()
+                self._hunt_nav_overlay.position_changed.connect(
+                    lambda x, y: self._on_overlay_pos_changed("huntnav", x, y)
+                )
             # 쿨 복귀 알림 오버레이 참조 주입 — edge(>0→0) 시 push_alert 호출.
             try:
                 if self._alert_overlay is not None:
@@ -1780,6 +1788,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._helper_overlay.set_opacity(op)
                 self._hpmp_overlay.set_opacity(op)
                 self._hunt_overlay.set_opacity(op)
+                self._hunt_nav_overlay.set_opacity(op)
             except Exception:
                 pass
             # msw 창 HWND 바인딩 — 드래그/자동 앵커 둘 다 이 창 client rect
@@ -1802,6 +1811,10 @@ class MainWindow(QtWidgets.QMainWindow):
                         pass
                     try:
                         self._hunt_overlay.attach_to_hwnd(hwnd)
+                    except Exception:
+                        pass
+                    try:
+                        self._hunt_nav_overlay.attach_to_hwnd(hwnd)
                     except Exception:
                         pass
                     self._append_log(
@@ -1830,12 +1843,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._hunt_overlay.set_anchor_regions(game_r, map_r)
             except Exception:
                 pass
+            try:
+                self._hunt_nav_overlay.set_anchor_regions(game_r, map_r)
+            except Exception:
+                pass
             # 수동 저장 위치 복원 (격수는 이게 주 경로).
             cd_pos = self._overlay_positions.get("cd")
             al_pos = self._overlay_positions.get("alert")
             hp_pos = self._overlay_positions.get("helper")
             hpmp_pos = self._overlay_positions.get("hpmp")
             hunt_pos = self._overlay_positions.get("hunt")
+            nav_pos = self._overlay_positions.get("huntnav")
             if cd_pos:
                 self._overlay.set_manual_pos(cd_pos[0], cd_pos[1])
             elif not game_r:
@@ -1875,6 +1893,17 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._hunt_overlay.move(40, 220)
                 except Exception:
                     pass
+            if nav_pos:
+                try:
+                    self._hunt_nav_overlay.set_manual_pos(
+                        nav_pos[0], nav_pos[1])
+                except Exception:
+                    pass
+            elif not game_r:
+                try:
+                    self._hunt_nav_overlay.move(700, 40)
+                except Exception:
+                    pass
             for idx, d in self._healer_cooldowns.items():
                 try:
                     self._overlay.update_healer(idx, d)
@@ -1889,30 +1918,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._helper_overlay.update_data(self._healer_cooldowns)
             except Exception:
                 pass
-            self._overlay.show()
-            self._alert_overlay.show()
-            # 사냥 도우미/힐러 HP/MP 는 격수 모드에서만 보여줌.
-            try:
-                if self.role == "attacker":
-                    self._helper_overlay.show()
-                else:
-                    self._helper_overlay.hide()
-            except Exception:
-                pass
-            try:
-                if self.role == "attacker":
-                    self._hpmp_overlay.show()
-                else:
-                    self._hpmp_overlay.hide()
-            except Exception:
-                pass
-            try:
-                if self.role == "attacker":
-                    self._hunt_overlay.show()
-                else:
-                    self._hunt_overlay.hide()
-            except Exception:
-                pass
+            # 표시: 다이얼로그에서 체크된 종류만 (2026-06-12).
+            if self._overlay_kind_on("cd"):
+                self._overlay.show()
+            if self._overlay_kind_on("alert"):
+                self._alert_overlay.show()
+            # 사냥 도우미/HP·MP/사냥분석/네비 는 격수 모드에서만.
+            for _k, _ov in (("helper", self._helper_overlay),
+                            ("hpmp", self._hpmp_overlay),
+                            ("hunt", self._hunt_overlay),
+                            ("huntnav", self._hunt_nav_overlay)):
+                try:
+                    if self.role == "attacker" and self._overlay_kind_on(_k):
+                        _ov.show()
+                    else:
+                        _ov.hide()
+                except Exception:
+                    pass
             # 체크박스 상태 동기 (체크됨 상태로 시작).
             try:
                 edit_on = self.chk_overlay_edit.isChecked()
@@ -1921,6 +1943,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._helper_overlay.set_edit_mode(edit_on)
                 self._hpmp_overlay.set_edit_mode(edit_on)
                 self._hunt_overlay.set_edit_mode(edit_on)
+                self._hunt_nav_overlay.set_edit_mode(edit_on)
             except Exception:
                 pass
             self._append_log("[오버레이] ON")
@@ -1935,8 +1958,73 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._hpmp_overlay.hide()
             if self._hunt_overlay is not None:
                 self._hunt_overlay.hide()
+            if self._hunt_nav_overlay is not None:
+                self._hunt_nav_overlay.hide()
             self._append_log("[오버레이] OFF")
         # 토글 상태 즉시 영속화 — 재시작 시 자동 복원 보장.
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+
+    def _open_overlay_dialog(self) -> None:
+        """오버레이 설정 창 열기 (비모달)."""
+        try:
+            self.overlay_dlg.show()
+            self.overlay_dlg.raise_()
+            self.overlay_dlg.activateWindow()
+        except Exception:
+            pass
+
+    def _overlay_kind_on(self, kind: str) -> bool:
+        """오버레이 종류별 표시 여부 (다이얼로그 체크박스)."""
+        try:
+            c = self.overlay_kind_chks.get(kind)
+            return bool(c.isChecked()) if c is not None else True
+        except Exception:
+            return True
+
+    def _on_overlay_kind_changed(self, kind: str, _state) -> None:
+        """오버레이 종류 체크 변경 → 즉시 표시 갱신 + 저장."""
+        try:
+            self._tick_overlay_visibility()
+        except Exception:
+            pass
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+        self._append_log(
+            f"[오버레이] {kind}={'ON' if self._overlay_kind_on(kind) else 'OFF'}"
+        )
+
+    def _on_cave_x_changed(self, v) -> None:
+        """선비족 네비 x 수동 지정 (0=자동) → 워커 즉시 반영."""
+        if (self.worker is not None
+                and hasattr(self.worker, "set_cave_x_override")):
+            try:
+                self.worker.set_cave_x_override(int(v))
+            except Exception:
+                pass
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+
+    def _on_cave_order_changed(self, text) -> None:
+        """굴 순서 텍스트 변경.
+
+        프로그램 자동입력(_cave_order_programmatic)은 트래커에 echo 하지 않음
+        (학습 유지). 사용자 직접 수정 → 수동 고정 / 비움 → 학습 재개.
+        """
+        if self._cave_order_programmatic:
+            return
+        if (self.worker is not None
+                and hasattr(self.worker, "set_cave_order_text")):
+            try:
+                self.worker.set_cave_order_text(str(text), user_edit=True)
+            except Exception:
+                pass
         try:
             self._save_settings()
         except Exception:
@@ -1945,7 +2033,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_toggle_overlay_edit(self, state) -> None:
         on = (state == QtCore.Qt.Checked)
         for ov in (self._overlay, self._alert_overlay, self._helper_overlay,
-                   self._hpmp_overlay, self._hunt_overlay):
+                   self._hpmp_overlay, self._hunt_overlay,
+                   self._hunt_nav_overlay):
             if ov is None:
                 continue
             try:
@@ -2496,7 +2585,7 @@ class MainWindow(QtWidgets.QMainWindow):
         map_r = self._regions.get("map")
         for ov in (self._overlay, self._alert_overlay, self._helper_overlay,
                    self._hpmp_overlay, self._skill_range_overlay,
-                   self._hunt_overlay):
+                   self._hunt_overlay, self._hunt_nav_overlay):
             if ov is None:
                 continue
             try:
@@ -2964,15 +3053,23 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
     def _set_overlays_visible(self, on: bool) -> None:
-        """overlay 들 show/hide 를 상태 기반으로 토글. 이미 맞으면 no-op."""
-        for ov in (self._overlay, self._alert_overlay, self._helper_overlay,
-                   self._hpmp_overlay, self._hunt_overlay):
+        """overlay 들 show/hide 를 상태 기반으로 토글. 이미 맞으면 no-op.
+
+        2026-06-12: 종류별 체크박스(OverlayDialog) 반영 — on 이어도 체크
+        해제된 종류는 hide."""
+        for kind, ov in (("cd", self._overlay),
+                         ("alert", self._alert_overlay),
+                         ("helper", self._helper_overlay),
+                         ("hpmp", self._hpmp_overlay),
+                         ("hunt", self._hunt_overlay),
+                         ("huntnav", self._hunt_nav_overlay)):
             if ov is None:
                 continue
+            want = bool(on) and self._overlay_kind_on(kind)
             try:
-                if on and not ov.isVisible():
+                if want and not ov.isVisible():
                     ov.show()
-                elif (not on) and ov.isVisible():
+                elif (not want) and ov.isVisible():
                     ov.hide()
             except Exception:
                 pass
@@ -3113,6 +3210,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     ("helper", self._helper_overlay),
                     ("hpmp", self._hpmp_overlay),
                     ("hunt", self._hunt_overlay),
+                    ("huntnav", self._hunt_nav_overlay),
                 ]
                 for _k, _ov in _pair:
                     if _ov is None:
@@ -3177,6 +3275,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._hunt_overlay.update_analytics(snap)
         except Exception:
             pass
+        # 선비족 네비 — 스냅샷 폴링 → 오버레이 + 텍스트필드 자동입력 + 안내.
+        try:
+            self._tick_hunt_nav()
+        except Exception:
+            pass
         # 세션 종료 보고.
         last = snap.get("last_report")
         if last:
@@ -3194,6 +3297,59 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._append_log(f"[사냥 보고] {msg}")
                 except Exception as e:
                     self._append_log(f"[사냥 보고] 표시 실패: {e}")
+
+    def _tick_hunt_nav(self) -> None:
+        """선비족 네비 스냅샷 → 오버레이 + 굴 순서 자동입력 + 안내 알림.
+
+        자동입력은 programmatic 플래그로 textChanged echo 를 차단 —
+        사용자 직접 수정만 트래커에 user_edit 로 전달 (학습/수동 구분 핵심).
+        """
+        if self.worker is None or not hasattr(
+                self.worker, "get_hunt_nav_snapshot"):
+            return
+        try:
+            snap = self.worker.get_hunt_nav_snapshot() or {}
+        except Exception:
+            snap = {}
+        if not snap:
+            return
+        # 1) 오버레이 갱신.
+        try:
+            if self._hunt_nav_overlay is not None:
+                self._hunt_nav_overlay.update_nav(snap)
+        except Exception:
+            pass
+        # 2) 텍스트필드 자동입력 (학습 잠정/확정 값 — 수동 모드는 auto_text
+        #    가 그 값 그대로라 무해. 새 값일 때만 1회 적용).
+        try:
+            auto = str(snap.get("auto_text") or "")
+            if auto and auto != self._cave_order_last_auto \
+                    and auto != self.cave_order_edit.text().replace(" ", ""):
+                self._cave_order_last_auto = auto
+                self._cave_order_programmatic = True
+                try:
+                    self.cave_order_edit.setText(auto)
+                finally:
+                    self._cave_order_programmatic = False
+        except Exception:
+            pass
+        # 3) 안내 알림 (notice_seq 증가 시 1회).
+        try:
+            seq = int(snap.get("notice_seq") or 0)
+            if seq != self._hunt_nav_notice_seq:
+                self._hunt_nav_notice_seq = seq
+                msg = str(snap.get("notice") or "")
+                if msg:
+                    self._append_log(f"[네비] {msg}")
+                    if (self._alert_overlay is not None
+                            and self._alert_overlay.isVisible()):
+                        self._alert_overlay.push_alert(
+                            f"네비: {msg}",
+                            duration_sec=5.0,
+                            color=QtGui.QColor(255, 210, 90),
+                        )
+        except Exception:
+            pass
 
     @staticmethod
     def _format_hunt_report_line(rec: dict) -> str:
@@ -3767,6 +3923,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
         except Exception as _e:
             self._append_log(f"[cd] 쿨 영역 주입 실패: {_e}")
+        # 선비족 네비 초기값 주입 (x 수동 + 굴 순서 — pending 으로 보관됨).
+        try:
+            if int(self.spin_cave_x.value()) > 0:
+                self.worker.set_cave_x_override(int(self.spin_cave_x.value()))
+            _ord = self.cave_order_edit.text().strip()
+            if _ord:
+                self.worker.set_cave_order_text(_ord, user_edit=True)
+        except Exception as _e:
+            self._append_log(f"[네비] 초기값 주입 실패: {_e}")
         # 2026-04-20: attacker_buff_region 분리 제거 — 버프 영역(공용) 사용.
         # 격수 공용 버프 영역 주입 (힐러 파혼술 트리거용 혼마술 감시도 겸함).
         try:

@@ -72,6 +72,10 @@ class Attacker:
         self.xp_ocr = XpOcr(log_cb=self.log)
         # 사냥 분석 — 바퀴/세션/일별 리포트.
         self.analytics = HuntAnalytics()
+        # 선비족 굴 순서 네비게이션 (2026-06-12). 맵변경 시 observe,
+        # GUI가 snapshot 폴링해 오버레이 표시. 키 입력 없음(표시 전용).
+        from .hunt_nav import CaveOrderTracker
+        self.hunt_nav = CaveOrderTracker(log_cb=self.log)
         # 격수 관측 맵 누적 — ocr.set_known_maps 로 주입하여 OCR 내부 canonical
         # 교정 활성화. 누적 안 하면 raw 깨진 이름("센비족", "선비족24")이
         # UDP + 리포트에 그대로 흘러들어감. 2026-04-19 실증.
@@ -199,6 +203,25 @@ class Attacker:
             return self.analytics.snapshot()
         except Exception:
             return {}
+
+    # ---- 선비족 네비게이션 API (2026-06-12) ----
+    def get_hunt_nav_snapshot(self) -> dict:
+        try:
+            return self.hunt_nav.snapshot()
+        except Exception:
+            return {}
+
+    def set_cave_order_text(self, text, user_edit: bool = True) -> None:
+        try:
+            self.hunt_nav.set_manual_text(text, user_edit=user_edit)
+        except Exception:
+            pass
+
+    def set_cave_x_override(self, x: int) -> None:
+        try:
+            self.hunt_nav.set_x_override(int(x))
+        except Exception:
+            pass
 
     def set_xp_region(self, x: int, y: int, w: int, h: int) -> None:
         try:
@@ -597,6 +620,11 @@ class Attacker:
                                 f"[HUNT-LAP] #{lap.lap_idx} map={lap.map_top} "
                                 f"dur={lap.duration_sec}s gain={lap.xp_gain}"
                             )
+                    except Exception:
+                        pass
+                    # 선비족 네비 — 굴(y) 시퀀스 학습/유도 (비매칭 맵 무시).
+                    try:
+                        self.hunt_nav.observe(r.map_name)
                     except Exception:
                         pass
                 # 2026-04-22 B안: hold 분기 제거. OCR 이 좌표를 뽑으면 그대로

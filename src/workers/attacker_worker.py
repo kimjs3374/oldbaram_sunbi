@@ -51,6 +51,9 @@ class AttackerWorker(QtCore.QThread):
         # HP/MP max pending — 사용자 입력 최대값 (OCR cur+max 분리 + pct 환산).
         self._pending_hp_max: int = 0
         self._pending_mp_max: int = 0
+        # 선비족 네비 pending (2026-06-12): 굴 순서 텍스트 + x 수동(0=자동).
+        self._pending_cave_order: str = ""
+        self._pending_cave_x: int = 0
 
     def stop(self):
         self._stop = True
@@ -189,6 +192,32 @@ class AttackerWorker(QtCore.QThread):
             return self._app.get_analytics_snapshot()
         except Exception:
             return {}
+
+    # ---- 선비족 네비게이션 API (2026-06-12) ----
+    def get_hunt_nav_snapshot(self) -> dict:
+        if self._app is None:
+            return {}
+        try:
+            return self._app.get_hunt_nav_snapshot()
+        except Exception:
+            return {}
+
+    def set_cave_order_text(self, text, user_edit: bool = True) -> None:
+        if user_edit:
+            self._pending_cave_order = str(text or "")
+        if self._app is not None:
+            try:
+                self._app.set_cave_order_text(text, user_edit=user_edit)
+            except Exception as e:
+                self.log.warning(f"[nav] set_cave_order 적용 실패: {e}")
+
+    def set_cave_x_override(self, x: int) -> None:
+        self._pending_cave_x = int(x)
+        if self._app is not None:
+            try:
+                self._app.set_cave_x_override(int(x))
+            except Exception as e:
+                self.log.warning(f"[nav] set_cave_x 적용 실패: {e}")
 
     def send_control(self, target_idx: int, cmd: str) -> bool:
         """격수 → 힐러(들) 제어 명령 송신.
@@ -413,6 +442,15 @@ class AttackerWorker(QtCore.QThread):
                     self._app.set_mp_max(int(self._pending_mp_max))
             except Exception as _e:
                 self.log.warning(f"[hpmp] max pending 적용 실패: {_e}")
+            # 선비족 네비 pending 적용.
+            try:
+                if self._pending_cave_x:
+                    self._app.set_cave_x_override(int(self._pending_cave_x))
+                if self._pending_cave_order.strip():
+                    self._app.set_cave_order_text(
+                        self._pending_cave_order, user_edit=True)
+            except Exception as _e:
+                self.log.warning(f"[nav] pending 적용 실패: {_e}")
             # Attacker.run은 self._stop 루프. stop()이 그걸 잡음.
             self._app.run()
         except Exception as e:

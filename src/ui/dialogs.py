@@ -144,6 +144,81 @@ class SkillDialog(QtWidgets.QDialog):
         lay.addWidget(self.btn_close)
 
 
+class OverlayDialog(QtWidgets.QDialog):
+    """오버레이 설정 전용 팝업 (2026-06-12 사용자 요청 — 별도 윈도우).
+
+    위젯 생성만 담당, 시그널은 main_window 에서 연결 (SkillRangeDialog 패턴).
+    체크된 오버레이만 표시 + 위치 편집 + 투명도.
+
+    외부 참조 위젯:
+      chk_overlay(전체 마스터), kind_chks(dict kind→QCheckBox),
+      chk_overlay_edit, slider_overlay_opacity, lbl_overlay_opacity.
+    """
+
+    # (kind, 라벨, 툴팁) — kind 는 위치 저장 키와 동일.
+    KINDS = (
+        ("cd", "힐러 쿨 상태", "힐러/쩔캐별 스킬 쿨(파력무참·백호·지폭지술) 표시"),
+        ("alert", "스킬 알림", "스킬 임박 카운트다운/이벤트 알림 (맵 아래 중앙)"),
+        ("helper", "사냥 도우미", "사용가능 스킬 + 파력무참 지속시간"),
+        ("hpmp", "힐러 HP/MP", "힐러별 HP/MP 막대"),
+        ("hunt", "사냥 분석", "사냥 시간/획득/바퀴 + 맵 히스토리"),
+        ("huntnav", "선비족 네비", "굴 사냥 순서 지도 — 다음 굴 강조"),
+    )
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("오버레이 설정")
+        self.resize(300, 320)
+        root = QtWidgets.QVBoxLayout(self)
+        root.setSpacing(6)
+
+        self.chk_overlay = QtWidgets.QCheckBox("오버레이 전체 ON")
+        self.chk_overlay.setToolTip(
+            "게임 화면 위 오버레이 전체 마스터 토글 (msw 위)."
+        )
+        root.addWidget(self.chk_overlay)
+
+        box = QtWidgets.QGroupBox("표시할 오버레이 (체크된 것만 보임)")
+        box_lay = QtWidgets.QVBoxLayout(box)
+        box_lay.setSpacing(3)
+        self.kind_chks: dict = {}
+        for kind, label, tip in self.KINDS:
+            c = QtWidgets.QCheckBox(label)
+            c.setToolTip(tip)
+            c.setChecked(True)
+            self.kind_chks[kind] = c
+            box_lay.addWidget(c)
+        root.addWidget(box)
+
+        self.chk_overlay_edit = QtWidgets.QCheckBox("위치 편집 (드래그로 이동)")
+        self.chk_overlay_edit.setToolTip(
+            "체크 시 오버레이에 마우스 입력 받아 드래그로 위치 이동 가능. "
+            "해제하면 입력 통과(클릭 무시) 모드로 복귀."
+        )
+        root.addWidget(self.chk_overlay_edit)
+
+        op_row = QtWidgets.QHBoxLayout()
+        op_row.addWidget(QtWidgets.QLabel("투명도"))
+        self.slider_overlay_opacity = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider_overlay_opacity.setMinimum(10)
+        self.slider_overlay_opacity.setMaximum(100)
+        self.slider_overlay_opacity.setSingleStep(5)
+        self.slider_overlay_opacity.setPageStep(10)
+        self.slider_overlay_opacity.setValue(90)
+        self.slider_overlay_opacity.setToolTip(
+            "오버레이 창 전체 투명도. 값이 낮을수록 투명."
+        )
+        self.lbl_overlay_opacity = QtWidgets.QLabel("90%")
+        self.lbl_overlay_opacity.setFixedWidth(36)
+        op_row.addWidget(self.slider_overlay_opacity, 1)
+        op_row.addWidget(self.lbl_overlay_opacity)
+        root.addLayout(op_row)
+
+        btn_close = QtWidgets.QPushButton("닫기")
+        btn_close.clicked.connect(self.hide)
+        root.addWidget(btn_close)
+
+
 class SkillRangeDialog(QtWidgets.QDialog):
     """격수 스킬범위 오버레이 설정 전용 팝업.
 
