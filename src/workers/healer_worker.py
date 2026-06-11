@@ -234,6 +234,8 @@ class HealerWorker(QtCore.QThread):
         #   (실패=abort 추종) → _pending_tab_lock(dist5)로 접근+TAB×2+재ON 위임.
         # 진행 중(_reanchor_active) 동안 스케줄러 시전 유예(자힐/부활 정지).
         self._reanchor_active: bool = False
+        # 1~3단계(self-target/clean확인) 동안 방향키 중단. 4단계(접근) 진입 시 해제.
+        self._reanchor_hold_move: bool = False
         self._reanchor_last_ts: float = 0.0
         self._hp100_since: float = 0.0      # 힐러 HP 100% 연속 시작 시각.
         self._last_reanchor_seq: int = 0     # 격수 F1 트리거 카운터 마지막 관측값.
@@ -593,12 +595,14 @@ class HealerWorker(QtCore.QThread):
         if self._reanchor_active:
             return
         self._reanchor_active = True
+        self._reanchor_hold_move = True  # 1~3단계 방향키 중단 시작.
         try:
             t = threading.Thread(target=self._run_reanchor_sequence,
                                  name="reanchor", daemon=True)
             t.start()
         except Exception as _e:
             self._reanchor_active = False
+            self._reanchor_hold_move = False
             self.log.warning(f"[REANCHOR] 스레드 시작 실패: {_e}")
 
     def _run_reanchor_sequence(self) -> None:
@@ -668,10 +672,13 @@ class HealerWorker(QtCore.QThread):
                         self._cycler.resume()
                     except Exception:
                         pass
+                self._reanchor_hold_move = False
                 self._reanchor_active = False
                 return
             # clean → 4~6은 _pending_tab_lock(dist5)에 위임. 메인루프가 일반
             # follow로 격수 접근 → dist≤5 시 TAB×2+토글재ON+resume+_reanchor 해제.
+            # 접근은 이동이 필요하므로 방향키 중단 해제(4단계 진입).
+            self._reanchor_hold_move = False
             self.log.info(
                 "[REANCHOR] 3) clean OK → 접근(dist≤5) 후 TAB×2 재고정 위임")
             self._pending_tab_lock_dist = 5
@@ -683,6 +690,7 @@ class HealerWorker(QtCore.QThread):
                     self._cycler.resume()
             except Exception:
                 pass
+            self._reanchor_hold_move = False
             self._reanchor_active = False
 
     def stop(self):
@@ -2730,6 +2738,11 @@ class HealerWorker(QtCore.QThread):
 
     def _decide_move(self, atk, fol, map_neq: bool) -> tuple:
         """B안 래퍼: 원 decision 결과에 STUCK 감지/언스턱 오버라이드 적용."""
+        # 재고정 시퀀스 1~3단계(self-target/토글OFF/clean확인) 동안 방향키 중단
+        # (사용자 2026-06-12): 이동 중이면 self-target 흔들림. 4단계(접근)는
+        # _reanchor_hold_move=False 로 풀려 정상 follow 이동.
+        if self._reanchor_hold_move:
+            return "-", "REANCHOR-HOLD 방향키 중단 (self-target 중)"
         want, reason = self._decide_move_raw(atk, fol, map_neq)
         return self._apply_stuck_filter(want, reason, atk, fol, map_neq)
 
