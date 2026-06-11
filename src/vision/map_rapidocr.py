@@ -11,6 +11,7 @@
   같은 구조 노이즈가 가끔 끼므로 여기서만 정리. base 글자는 절대 바꾸지 않음
   (knownmaps 기반 base 보정은 ocr.py 가 담당 — 과보정 방지 책임 분리).
 """
+import os
 import re
 import pathlib
 
@@ -19,6 +20,19 @@ _REC = _DIR / "korean_rec.onnx"
 _DICT = _DIR / "korean_dict.txt"
 _engine = None
 _init_failed = False
+
+
+def _intra_threads() -> int:
+    """RapidOCR intra_op 스레드 수 (기본 2, env OB_OCR_INTRA_THREADS 조정).
+
+    YOLO(onnx)·RapidOCR·digit_cnn 가 각자 전체코어를 잡으면 CPU 과구독으로
+    YOLO predict spike → OCR 계열은 2스레드로 캡해 코어를 YOLO에 양보.
+    rec-only(use_det=False)는 2스레드로도 ~14ms (전체코어 12ms와 사실상 동일).
+    """
+    try:
+        return max(1, int(os.environ.get("OB_OCR_INTRA_THREADS", "2")))
+    except Exception:
+        return 2
 
 # 맵명 유효 문자: 한글/숫자/괄호/하이픈. 끝 영문(횃불 오인 G 등) 제거.
 _KEEP = re.compile(r"[^가-힣0-9()\-]")
@@ -34,8 +48,12 @@ def _get_engine():
         return _engine
     try:
         from rapidocr_onnxruntime import RapidOCR
+        # intra_op 스레드 캡 — det/cls/rec 세션 전부 동일 적용(전체코어 점유 방지).
+        _nt = _intra_threads()
         _engine = RapidOCR(rec_model_path=str(_REC),
-                           rec_keys_path=str(_DICT))
+                           rec_keys_path=str(_DICT),
+                           intra_op_num_threads=_nt,
+                           inter_op_num_threads=1)
     except Exception:
         _init_failed = True
         _engine = None

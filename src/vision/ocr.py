@@ -274,7 +274,9 @@ class Ocr:
                      / "digit_cnn.onnx")
         self._digit_cnn = DigitCnn(_cnn_path)
         self._use_coord_cnn = self._digit_cnn.ready()
-        self._coord_device_note = "digit_cnn-onnx(no-torch)"
+        # intra_op 스레드 캡 노출(배포 후 로그로 적용 확인용. 기본 2).
+        from .digit_cnn import _intra_threads as _it
+        self._coord_device_note = f"digit_cnn-onnx(no-torch,intra={_it()})"
         # 맵 OCR 비동기 워커 (선택). attach_map_worker 로 붙이면 read() 의
         # 맵 블록이 비블로킹으로 전환 (메인 루프에서 RapidOCR predict 를
         # 호출하지 않음). sync fallback 은 _async_map is None 일 때 유지.
