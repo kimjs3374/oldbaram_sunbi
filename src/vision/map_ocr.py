@@ -205,8 +205,13 @@ class MapOcrWorker:
             pass
 
     def _one_cycle(self) -> None:
-        crnn_ok = self._crnn is not None and self._crnn.ready()
-        if self._rec is None and not crnn_ok:
+        # RapidOCR(korean) 우선 — 일반 OCR이라 숫자 조합무관, 한글 정확.
+        try:
+            from . import map_rapidocr
+            _rapid_ok = map_rapidocr.ready()
+        except Exception:
+            _rapid_ok = False
+        if self._rec is None and not _rapid_ok:
             return
         with self._lock:
             frame = self._latest_frame
@@ -222,18 +227,12 @@ class MapOcrWorker:
         if crop is None or crop.size == 0:
             return
         raw = ""
-        # CRNN 우선 (게임폰트 학습, 한글+숫자 정확). 빈값이면 PaddleOCR fallback.
-        if crnn_ok:
+        # RapidOCR(korean) 우선 (한글+숫자 ~100%, 조합무관). 빈값이면 PaddleOCR.
+        if _rapid_ok:
             try:
-                raw, conf = self._crnn.predict(crop)
-                raw = raw or ""
+                raw = map_rapidocr.read_map(crop)
             except Exception:
-                raw, conf = "", 0.0
-            # 2026-06-11 진단/재학습: 실게임 worker crop 전부 수집.
-            # CRNN이 학습(ocr sync crop)과 다른 worker crop을 conf 높게 오인식
-            # ('선비족1'→'선비족' 숫자누락) → conf<0.5 안 걸려 수집 0. 학습=추론
-            # crop 일치 위해 worker crop 으로 재수집 후 재학습 필요. (throttle 1.5s)
-            self._save_collect(crop)
+                raw = ""
         if not raw and self._rec is not None:
             try:
                 preds = self._rec.predict(crop)

@@ -40,3 +40,4 @@ pywin32==311
 
 # --- 설정 파일 ---
 PyYAML==6.0.2
+rapidocr_onnxruntime

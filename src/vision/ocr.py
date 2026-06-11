@@ -970,16 +970,15 @@ class Ocr:
                 _prof_map_hit = True
                 _prof_t_m0 = time.perf_counter()
                 mc = self._crop_map(frame)
-                # CRNN 우선 (게임폰트 학습). 빈값이면 PaddleOCR fallback.
+                # RapidOCR(korean) 우선 (한글+숫자 ~100%, 조합무관). 빈값이면
+                # PaddleOCR fallback.
                 _raw = ""
-                if getattr(self, "map_crnn", None) is not None:
-                    try:
-                        _raw, _conf = self.map_crnn.predict(mc)
-                        _raw = _raw or ""
-                        if _conf < 0.5:
-                            self._save_collect_crop(mc)
-                    except Exception:
-                        _raw = ""
+                try:
+                    from .map_rapidocr import read_map as _rmap, ready as _rr
+                    if _rr():
+                        _raw = _rmap(mc)
+                except Exception:
+                    _raw = ""
                 if not _raw:
                     _raw = " ".join(self._extract_texts(self.map.predict(mc)))
                 _prof_map_ms = (time.perf_counter() - _prof_t_m0) * 1000
