@@ -143,6 +143,8 @@ def collect(mw) -> dict:
             if hasattr(mw, "spin_jipok_gyoung") else 3,
         "spin_jipok_jipok": int(mw.spin_jipok_jipok.value())
             if hasattr(mw, "spin_jipok_jipok") else 4,
+        "spin_jipok_cd": int(mw.spin_jipok_cd.value())
+            if hasattr(mw, "spin_jipok_cd") else 30,
         "jipok_maps": mw.jipok_maps_edit.text()
             if hasattr(mw, "jipok_maps_edit") else "",
         # Window geometry
@@ -566,6 +568,8 @@ def load(mw):
         if g("spin_jipok_jipok") is not None and hasattr(
                 mw, "spin_jipok_jipok"):
             mw.spin_jipok_jipok.setValue(int(g("spin_jipok_jipok")))
+        if g("spin_jipok_cd") is not None and hasattr(mw, "spin_jipok_cd"):
+            mw.spin_jipok_cd.setValue(int(g("spin_jipok_cd")))
         if g("jipok_maps") is not None and hasattr(mw, "jipok_maps_edit"):
             mw.jipok_maps_edit.setText(str(g("jipok_maps")))
     except Exception:

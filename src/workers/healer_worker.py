@@ -270,6 +270,10 @@ class HealerWorker(QtCore.QThread):
         self._jipok_hold_move: bool = False  # 시퀀스 중 방향키 중단.
         self._jipok_mp_done_pct: int = 90  # 공력증강 완료 판정 MP%.
         self._jipok_timeout_s: float = 15.0  # 공증 재시도 한도.
+        # 지폭지술 쿨 표시용 (격수 오버레이). 시전 시각 + 쿨길이(GUI 주입)
+        # 타이머 — 시전 주체가 본인이라 OCR 불필요(경량 유지).
+        self.jipok_cooldown_sec: int = 30
+        self._jipok_last_cast_ts: float = 0.0
         # 2026-04-24 자힐 중 빨탭 우클릭으로 격수 거리 좁히기. 0.5s 간격 throttle.
         self._seq_rclick_last_ts: float = 0.0
         # _hook_block_ab 진입 시점에 잡은 YOLO 빨탭 절대 화면 좌표. 자힐
@@ -799,6 +803,21 @@ class HealerWorker(QtCore.QThread):
         self.log.info(f"[JIPOK] 트리거(F2) {reason} → 시퀀스 시작")
         self._start_jipok_sequence()
 
+    def _jipok_cd_remaining(self) -> int:
+        """지폭지술 남은 쿨 (격수 오버레이 표시용).
+
+        -1=미해당(쩔캐 현인 아님), 0=준비됨(미시전 포함), >0=남은 초.
+        시전 시각 기반 로컬 타이머 — OCR 없음.
+        """
+        if not (getattr(self, "jjeol_mode", False)
+                and getattr(self, "jjeol_hyeonin", False)):
+            return -1
+        ts = float(getattr(self, "_jipok_last_cast_ts", 0.0) or 0.0)
+        if ts <= 0.0:
+            return 0
+        rem = int(self.jipok_cooldown_sec) - int(time.time() - ts)
+        return max(0, rem)
+
     def _start_jipok_sequence(self) -> None:
         """지폭지술 시퀀스 시작 (별도 스레드).
 
@@ -856,6 +875,7 @@ class HealerWorker(QtCore.QThread):
                 return
             # 2) 지폭지술 1회.
             press_normal_vk(_vk_j)
+            self._jipok_last_cast_ts = time.time()  # 쿨 타이머 시작.
             self.log.info(f"[JIPOK] 2) 지폭지술 시전 vk={hex(_vk_j)} → 추종 복귀")
             time.sleep(0.3)
         except Exception as _e:
@@ -2775,6 +2795,7 @@ class HealerWorker(QtCore.QThread):
                                     )),
                                     cd_parlyuk=int(p_rem),
                                     cd_baekho=int(b_rem),
+                                    cd_jipok=self._jipok_cd_remaining(),
                                     ts_ms=now_ms(),
                                     armed=bool(self.armed),
                                     nickname=str(cd_read.nickname or ""),

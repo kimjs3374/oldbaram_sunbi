@@ -19,7 +19,7 @@ import threading
 from datetime import datetime
 
 from ..config import load as load_cfg
-from .overlay import GameOverlay, SkillAlertOverlay
+from .overlay import GameOverlay, HuntOverlay, SkillAlertOverlay
 from .region_picker import RegionPicker
 from .region_overlay import RegionOverlay
 from .status_strip import StatusStrip
@@ -60,6 +60,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._hpmp_overlay = None  # type: Optional["HealerStatusOverlay"]
         # 격수 스킬 범위 오버레이. 체크박스(chk_skill_range) 로 개별 토글.
         self._skill_range_overlay = None  # type: Optional["SkillRangeOverlay"]
+        # 사냥 분석/맵 히스토리 오버레이 (2026-06-12 GameOverlay에서 분리).
+        # 격수 모드 전용, 위치 키 "hunt".
+        self._hunt_overlay = None  # type: Optional[HuntOverlay]
         # 알림 edge 트리거 상태 (힐러별 직전 remaining 초).
         self._alert_prev: dict[int, dict] = {}
         # 힐러별 마지막 event_seq. 새 이벤트 수신 감지용.
@@ -67,7 +70,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # 공증 임박 edge 트리거 상태 (힐러별). True = 현재 임박 구간 안.
         # mp_pct 가 (thr+10) 이하로 cross-down 순간 1회 알림.
         self._gyoungryeok_imminent_prev: dict[int, bool] = {}
-        # 오버레이 수동 위치 (설정 영속화). {"cd","alert","helper","hpmp"}: (x,y).
+        # 오버레이 수동 위치 (설정 영속화).
+        # {"cd","alert","helper","hpmp","hunt"}: (x,y).
         self._overlay_positions: dict[str, tuple] = {}
         # 6개 추가 영역 (game/map/coord/xp/hp/mp) — cd/nick은 cfg.cooldown에 저장.
         self._regions: dict[str, tuple] = {}
@@ -436,6 +440,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_jipok_jipok.setValue(4)
         self.spin_jipok_jipok.valueChanged.connect(self._on_jipok_keys_changed)
         _jj_keys.addWidget(self.spin_jipok_jipok)
+        # 지폭지술 쿨타임(초) — 격수 오버레이 쿨 표기용 (시전시각 타이머).
+        _jj_keys.addWidget(QtWidgets.QLabel("쿨(초)"))
+        self.spin_jipok_cd = QtWidgets.QSpinBox()
+        self.spin_jipok_cd.setRange(1, 3600)
+        self.spin_jipok_cd.setValue(30)
+        self.spin_jipok_cd.setToolTip(
+            "지폭지술 쿨타임(초). 시전 시각 기준 격수 오버레이에 잔여 쿨 표시."
+        )
+        self.spin_jipok_cd.valueChanged.connect(self._on_jipok_cd_changed)
+        _jj_keys.addWidget(self.spin_jipok_cd)
         _jj_keys.addStretch(1)
         self._jipok_keys_container = QtWidgets.QWidget()
         self._jipok_keys_container.setLayout(_jj_keys)
@@ -1045,6 +1059,17 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._hpmp_overlay.show()
                 elif (not want) and self._hpmp_overlay.isVisible():
                     self._hpmp_overlay.hide()
+        except Exception:
+            pass
+        # 사냥 분석/맵 히스토리 오버레이 — 격수 모드 + 오버레이 ON일 때만 show.
+        try:
+            if self._hunt_overlay is not None:
+                want = (not is_healer) and (self._overlay is not None
+                                            and self._overlay.isVisible())
+                if want and not self._hunt_overlay.isVisible():
+                    self._hunt_overlay.show()
+                elif (not want) and self._hunt_overlay.isVisible():
+                    self._hunt_overlay.hide()
         except Exception:
             pass
         # 스킬범위 오버레이 — 격수 모드 + 체크박스 ON일 때만 show.
@@ -1736,6 +1761,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._hpmp_overlay.position_changed.connect(
                     lambda x, y: self._on_overlay_pos_changed("hpmp", x, y)
                 )
+            if self._hunt_overlay is None:
+                self._hunt_overlay = HuntOverlay()
+                self._hunt_overlay.position_changed.connect(
+                    lambda x, y: self._on_overlay_pos_changed("hunt", x, y)
+                )
             # 쿨 복귀 알림 오버레이 참조 주입 — edge(>0→0) 시 push_alert 호출.
             try:
                 if self._alert_overlay is not None:
@@ -1749,6 +1779,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._alert_overlay.set_opacity(op)
                 self._helper_overlay.set_opacity(op)
                 self._hpmp_overlay.set_opacity(op)
+                self._hunt_overlay.set_opacity(op)
             except Exception:
                 pass
             # msw 창 HWND 바인딩 — 드래그/자동 앵커 둘 다 이 창 client rect
@@ -1767,6 +1798,10 @@ class MainWindow(QtWidgets.QMainWindow):
                         pass
                     try:
                         self._hpmp_overlay.attach_to_hwnd(hwnd)
+                    except Exception:
+                        pass
+                    try:
+                        self._hunt_overlay.attach_to_hwnd(hwnd)
                     except Exception:
                         pass
                     self._append_log(
@@ -1791,11 +1826,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._hpmp_overlay.set_anchor_regions(game_r, map_r)
             except Exception:
                 pass
+            try:
+                self._hunt_overlay.set_anchor_regions(game_r, map_r)
+            except Exception:
+                pass
             # 수동 저장 위치 복원 (격수는 이게 주 경로).
             cd_pos = self._overlay_positions.get("cd")
             al_pos = self._overlay_positions.get("alert")
             hp_pos = self._overlay_positions.get("helper")
             hpmp_pos = self._overlay_positions.get("hpmp")
+            hunt_pos = self._overlay_positions.get("hunt")
             if cd_pos:
                 self._overlay.set_manual_pos(cd_pos[0], cd_pos[1])
             elif not game_r:
@@ -1823,6 +1863,16 @@ class MainWindow(QtWidgets.QMainWindow):
             elif not game_r:
                 try:
                     self._hpmp_overlay.move(40, 500)
+                except Exception:
+                    pass
+            if hunt_pos:
+                try:
+                    self._hunt_overlay.set_manual_pos(hunt_pos[0], hunt_pos[1])
+                except Exception:
+                    pass
+            elif not game_r:
+                try:
+                    self._hunt_overlay.move(40, 220)
                 except Exception:
                     pass
             for idx, d in self._healer_cooldowns.items():
@@ -1856,6 +1906,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._hpmp_overlay.hide()
             except Exception:
                 pass
+            try:
+                if self.role == "attacker":
+                    self._hunt_overlay.show()
+                else:
+                    self._hunt_overlay.hide()
+            except Exception:
+                pass
             # 체크박스 상태 동기 (체크됨 상태로 시작).
             try:
                 edit_on = self.chk_overlay_edit.isChecked()
@@ -1863,6 +1920,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._alert_overlay.set_edit_mode(edit_on)
                 self._helper_overlay.set_edit_mode(edit_on)
                 self._hpmp_overlay.set_edit_mode(edit_on)
+                self._hunt_overlay.set_edit_mode(edit_on)
             except Exception:
                 pass
             self._append_log("[오버레이] ON")
@@ -1875,6 +1933,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._helper_overlay.hide()
             if self._hpmp_overlay is not None:
                 self._hpmp_overlay.hide()
+            if self._hunt_overlay is not None:
+                self._hunt_overlay.hide()
             self._append_log("[오버레이] OFF")
         # 토글 상태 즉시 영속화 — 재시작 시 자동 복원 보장.
         try:
@@ -1885,7 +1945,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_toggle_overlay_edit(self, state) -> None:
         on = (state == QtCore.Qt.Checked)
         for ov in (self._overlay, self._alert_overlay, self._helper_overlay,
-                   self._hpmp_overlay):
+                   self._hpmp_overlay, self._hunt_overlay):
             if ov is None:
                 continue
             try:
@@ -2435,7 +2495,8 @@ class MainWindow(QtWidgets.QMainWindow):
         game_r = self._regions.get("game")
         map_r = self._regions.get("map")
         for ov in (self._overlay, self._alert_overlay, self._helper_overlay,
-                   self._hpmp_overlay, self._skill_range_overlay):
+                   self._hpmp_overlay, self._skill_range_overlay,
+                   self._hunt_overlay):
             if ov is None:
                 continue
             try:
@@ -2663,6 +2724,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.spin_jipok_gyoung.value())
             self.worker.jipok_vk_jipok = self._numpad_vk(
                 self.spin_jipok_jipok.value())
+
+    def _on_jipok_cd_changed(self, v):
+        """지폭지술 쿨타임(초) 변경 → 워커 실시간 반영."""
+        if self.worker and hasattr(self.worker, "jipok_cooldown_sec"):
+            self.worker.jipok_cooldown_sec = int(v)
 
     def _on_jipok_maps_changed(self, text):
         """지폭지술 시전 굴 변경 → 워커 실시간 반영."""
@@ -2900,7 +2966,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_overlays_visible(self, on: bool) -> None:
         """overlay 들 show/hide 를 상태 기반으로 토글. 이미 맞으면 no-op."""
         for ov in (self._overlay, self._alert_overlay, self._helper_overlay,
-                   self._hpmp_overlay):
+                   self._hpmp_overlay, self._hunt_overlay):
             if ov is None:
                 continue
             try:
@@ -3046,6 +3112,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     ("alert", self._alert_overlay),
                     ("helper", self._helper_overlay),
                     ("hpmp", self._hpmp_overlay),
+                    ("hunt", self._hunt_overlay),
                 ]
                 for _k, _ov in _pair:
                     if _ov is None:
@@ -3104,10 +3171,10 @@ class MainWindow(QtWidgets.QMainWindow):
             snap = {}
         if not snap:
             return
-        # 오버레이 업데이트 (오버레이 비활성 시 None 방어).
+        # 사냥 오버레이 업데이트 (2026-06-12 GameOverlay→HuntOverlay 분리).
         try:
-            if self._overlay is not None:
-                self._overlay.update_analytics(snap)
+            if self._hunt_overlay is not None:
+                self._hunt_overlay.update_analytics(snap)
         except Exception:
             pass
         # 세션 종료 보고.
@@ -3607,6 +3674,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.worker.jipok_vk_jipok = self._numpad_vk(
                 self.spin_jipok_jipok.value())
             self.worker.set_jipok_maps(self.jipok_maps_edit.text())
+            self.worker.jipok_cooldown_sec = int(self.spin_jipok_cd.value())
             # 스킬/NumLock 싸이클 전면 OFF (지폭 시퀀스가 직접 키 송신).
             self.worker.skill_enabled = {n: False for n in self.skill_chks}
             self.worker.primary_vks = []

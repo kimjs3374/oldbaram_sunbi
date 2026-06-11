@@ -303,6 +303,8 @@ class AttackerWorker(QtCore.QThread):
                             "src_ip": src_ip,
                             "cd_parlyuk": rep.cd_parlyuk,
                             "cd_baekho": rep.cd_baekho,
+                            # 2026-06-12: 쩔캐(현인) 지폭지술 쿨.
+                            "cd_jipok": int(getattr(rep, "cd_jipok", -1)),
                             "ts_ms": rep.ts_ms,
                             "armed": bool(getattr(rep, "armed", False)),
                             "nickname": str(getattr(rep, "nickname", "") or ""),
@@ -332,6 +334,17 @@ class AttackerWorker(QtCore.QThread):
                                 rep, "self_heal_hp_thr", -1)),
                             "gyoungryeok_mp_thr": int(getattr(
                                 rep, "gyoungryeok_mp_thr", -1)),
+                            # 2026-06-12: 힐러 맵/좌표/상태 — heartbeat.py 경로엔
+                            # 있었는데 워커 가동 중 경로엔 누락돼 행 표시가 idle
+                            # 때만 갱신되던 갭. 동일 키로 채워 parity 맞춤.
+                            "healer_map": str(getattr(
+                                rep, "healer_map", "") or ""),
+                            "healer_x": int(getattr(rep, "healer_x", 0)),
+                            "healer_y": int(getattr(rep, "healer_y", 0)),
+                            "coord_valid": bool(getattr(
+                                rep, "coord_valid", False)),
+                            "state_text": str(getattr(
+                                rep, "state_text", "") or ""),
                         })
                     except Exception as _e:
                         try:

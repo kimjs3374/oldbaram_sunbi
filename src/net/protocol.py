@@ -116,6 +116,9 @@ class CooldownReport:
     src_idx: int = 0
     cd_parlyuk: int = -1
     cd_baekho: int = -1
+    # 2026-06-12: 쩔캐(현인) 지폭지술 남은 쿨 (시전시각 타이머 기반).
+    # -1=미해당(현인 아님/쩔캐 아님), 0=준비됨, >0=남은 초.
+    cd_jipok: int = -1
     ts_ms: int = 0
     armed: bool = False
     nickname: str = ""

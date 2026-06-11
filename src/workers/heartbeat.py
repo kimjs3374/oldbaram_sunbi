@@ -85,6 +85,8 @@ class AttackerHeartbeat(QtCore.QThread):
                         "src_ip": src_ip,
                         "cd_parlyuk": rep.cd_parlyuk,
                         "cd_baekho": rep.cd_baekho,
+                        # 2026-06-12: 쩔캐(현인) 지폭지술 쿨.
+                        "cd_jipok": int(getattr(rep, "cd_jipok", -1)),
                         "ts_ms": rep.ts_ms,
                         "armed": getattr(rep, "armed", False),
                         "nickname": getattr(rep, "nickname", ""),

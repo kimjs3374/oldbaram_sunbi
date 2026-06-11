@@ -34,6 +34,20 @@ def _fmt_cd(sec: int) -> str:
     return f"{sec}s"
 
 
+def _fmt_cd_kr(sec: int) -> str:
+    """쿨 표기 (2026-06-12 사용자 요청): 준비=한글 '준비됨', 쿨중=잔여초.
+
+    예) '준비됨' / '30s' / '2m14s'. 음수(미측정/미해당)는 호출측에서 숨김.
+    """
+    if sec is None or sec <= 0:
+        return "준비됨"
+    if sec >= 60:
+        m = sec // 60
+        s = sec % 60
+        return f"{m}m{s:02d}s"
+    return f"{sec}s"
+
+
 def _fmt_xph(n: int) -> str:
     if not n or n <= 0:
         return "-"
@@ -357,13 +371,15 @@ class _ScaledOverlay(QtWidgets.QWidget):
 
 
 class GameOverlay(_ScaledOverlay):
-    """힐러별 남은 쿨 + 시간당 경험치 + 사냥 분석 (왼쪽 고정)."""
+    """힐러/쩔캐별 스킬 쿨 상태 + 시간당 경험치 (왼쪽 고정).
+
+    2026-06-12: 사냥 분석/맵 히스토리 섹션은 HuntOverlay 로 분리.
+    쿨 표기: 준비됨(쿨0) / 잔여초 — 측정된 스킬은 항상 줄 표시.
+    """
 
     def __init__(self):
         super().__init__()
         self._rows: dict[int, dict] = {}
-        # 사냥 분석 섹션용 최신 snapshot. MainWindow가 주기 주입.
-        self._analytics: Optional[dict] = None
         self._base_w = 240
         self.setFixedSize(self._base_w, 80)
         self._tick_timer = QtCore.QTimer(self)
@@ -373,11 +389,6 @@ class GameOverlay(_ScaledOverlay):
 
     def _on_tick(self) -> None:
         # 로컬 감산으로 줄 수가 바뀔 수 있으니 레이아웃도 주기 재계산.
-        self._relayout()
-        self.update()
-
-    def update_analytics(self, snap: Optional[dict]) -> None:
-        self._analytics = snap or None
         self._relayout()
         self.update()
 
@@ -423,12 +434,19 @@ class GameOverlay(_ScaledOverlay):
             new_b = int(cur.get("b", -1))
         else:
             b_ts = now
+        # 지폭지술 (쩔캐 현인, 2026-06-12). -1=미해당 → stick 없이 그대로
+        # 반영해 현인 OFF 시 줄이 즉시 사라지게 (타이머 기반이라 OCR 실패
+        # 프레임 개념 없음).
+        new_j = int(d.get("cd_jipok", -1))
+        j_ts = now if new_j >= 0 else 0.0
         self._rows[key] = {
             "nick": new_nick,
             "p": new_p,
             "b": new_b,
+            "j": new_j,
             "p_ts": p_ts,
             "b_ts": b_ts,
+            "j_ts": j_ts,
             "armed": bool(d.get("armed", False)),
             "has_armed": "armed" in d,
             "xph": int(d.get("xp_per_hour", 0) or 0),
@@ -450,20 +468,117 @@ class GameOverlay(_ScaledOverlay):
         return max(0, int(cd) - elapsed)
 
     def _visible_lines(self) -> list[tuple[int, str, str, int]]:
+        """측정된(>=0) 스킬은 쿨 0이어도 항상 표시 — '준비됨' (2026-06-12).
+        -1(미측정/미해당)만 숨김. 지폭지술은 쩔캐(현인) 행에서만 >=0."""
         lines: list[tuple[int, str, str, int]] = []
         for idx in sorted(self._rows.keys()):
             r = self._rows[idx]
             nick = r["nick"] or f"힐러{idx + 1}"
             p = self._eff_cd(r.get("p", -1), r.get("p_ts", 0.0))
             b = self._eff_cd(r.get("b", -1), r.get("b_ts", 0.0))
+            j = self._eff_cd(r.get("j", -1), r.get("j_ts", 0.0))
             xph = r["xph"]
-            if p > 0:
-                lines.append((idx, nick, f"파력무참 {_fmt_cd(p)}", p))
-            if b > 0:
-                lines.append((idx, nick, f"백호의희원 {_fmt_cd(b)}", b))
+            if p >= 0:
+                lines.append((idx, nick, f"파력무참 : {_fmt_cd_kr(p)}", p))
+            if b >= 0:
+                lines.append((idx, nick, f"백호의희원 : {_fmt_cd_kr(b)}", b))
+            if j >= 0:
+                lines.append((idx, nick, f"지폭지술 : {_fmt_cd_kr(j)}", j))
             if xph > 0:
                 lines.append((idx, nick, _fmt_xph(xph), -1))
         return lines
+
+    def _relayout(self) -> None:
+        w = self._px(self._base_w)
+        lines = self._visible_lines()
+        n = len(lines)
+        row_h = self._px(22)
+        head_h = self._px(30)
+        pad = self._px(8)
+        h = head_h + (row_h * max(1, n)) + pad
+        self.setFixedSize(w, h)
+
+    def paintEvent(self, _ev):
+        qp = QtGui.QPainter(self)
+        qp.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        # ===== 배경·테두리: 투명도 적용 =====
+        qp.setPen(QtCore.Qt.NoPen)
+        qp.setBrush(QtGui.QColor(18, 20, 26, self._a(200)))
+        radius = self._px(8)
+        qp.drawRoundedRect(self.rect(), radius, radius)
+        qp.setPen(QtGui.QColor(90, 110, 160, self._a(255)))
+        qp.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), radius, radius)
+        # ===== 이하 글씨: 투명도 영향 없이 원본 alpha 로 렌더 =====
+        left_pad = self._px(12)
+        nick_col = self._px(90)
+        qp.setFont(self._font(10))
+        qp.setPen(QtGui.QColor(180, 210, 255))
+        qp.drawText(left_pad, self._px(20), "힐러 상태")
+        lines = self._visible_lines()
+        y = self._px(38)
+        row_h = self._px(22)
+        if not lines:
+            qp.setFont(self._font(9, bold=False))
+            qp.setPen(QtGui.QColor(140, 140, 150))
+            qp.drawText(left_pad, y, "힐러 수신 대기")
+            y += row_h
+        else:
+            qp.setFont(self._font(11))
+            last_idx = -999
+            for idx, nick, text, cd in lines:
+                if idx != last_idx:
+                    qp.setPen(QtGui.QColor(120, 200, 255))
+                    qp.drawText(left_pad, y, f"{nick}")
+                    last_idx = idx
+                # cd<=0: 준비됨/xph(녹색). 쿨 임박~진행은 잔여초별 색.
+                if cd <= 0:
+                    color = QtGui.QColor(160, 230, 160)
+                elif cd <= 5:
+                    color = QtGui.QColor(240, 80, 80)
+                elif cd <= 15:
+                    color = QtGui.QColor(240, 170, 60)
+                else:
+                    color = QtGui.QColor(210, 210, 220)
+                qp.setPen(color)
+                qp.drawText(nick_col, y, text)
+                y += row_h
+        self._draw_edit_hint(qp)
+
+
+class HuntOverlay(_ScaledOverlay):
+    """사냥 분석 + 맵 히스토리 전용 오버레이 (2026-06-12 GameOverlay에서 분리).
+
+    격수 모드 전용. MainWindow._tick_analytics 가 update_analytics(snap) 주입.
+    위치는 'hunt' 키로 별도 저장/드래그 (위치 편집 모드 공통).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._analytics: Optional[dict] = None
+        self._base_w = 240
+        self.setFixedSize(self._base_w, 60)
+
+    def update_analytics(self, snap: Optional[dict]) -> None:
+        self._analytics = snap or None
+        self._relayout()
+        self.update()
+
+    def _on_scale_changed(self) -> None:
+        self._relayout()
+        self._reanchor()
+
+    def _reanchor(self) -> None:
+        """우선순위: 수동 위치 > game_rect 좌상단+아래 오프셋 > 유지."""
+        if self._manual_pos is not None:
+            mx, my = self._manual_pos
+            cx, cy = self._clamp_to_bound(mx, my)
+            self.move(cx, cy)
+            return
+        if self._game_rect:
+            gx, gy, _, _ = self._game_rect
+            # GameOverlay(쿨 상태)가 좌상단을 쓰므로 그 아래 기본 배치.
+            cx, cy = self._clamp_to_bound(int(gx), int(gy) + self._px(180))
+            self.move(cx, cy)
 
     def _analytics_lines(self) -> list[str]:
         """사냥 분석 섹션 (시간/획득/시간당/바퀴). 맵 히스토리는 별도 섹션."""
@@ -525,33 +640,20 @@ class GameOverlay(_ScaledOverlay):
 
     def _relayout(self) -> None:
         w = self._px(self._base_w)
-        lines = self._visible_lines()
-        n = len(lines)
-        row_h = self._px(22)
-        head_h = self._px(30)
-        pad = self._px(8)
-        # 공통 섹션 크기 상수.
-        sep_gap = self._px(10)
         title_h = self._px(22)
         inner_row_h = self._px(18)
-        # 사냥 분석 섹션.
+        sep_gap = self._px(10)
+        pad = self._px(10)
         a_lines = self._analytics_lines()
-        a_h = 0
-        if a_lines:
-            a_h = sep_gap + title_h + inner_row_h * len(a_lines) + self._px(4)
-        # 맵 히스토리 섹션.
         m_lines = self._map_history_lines()
-        m_h = 0
+        h = title_h + pad
+        h += inner_row_h * max(1, len(a_lines))
         if m_lines:
-            m_h = sep_gap + title_h + inner_row_h * len(m_lines) + self._px(4)
-        h = head_h + (row_h * max(1, n)) + a_h + m_h + pad
-        self.setFixedSize(w, h)
+            h += sep_gap + title_h + inner_row_h * len(m_lines)
+        self.setFixedSize(w, h + self._px(6))
 
     def _draw_section_header(self, qp, y: int, left_pad: int, title: str) -> int:
-        """구분선 + 섹션 타이틀. 다음 라인 y 반환.
-
-        구분선은 배경 계열이라 투명도 적용, 타이틀 글씨는 원본 그대로.
-        """
+        """구분선 + 섹션 타이틀. 다음 라인 y 반환."""
         sep_y = y + self._px(2)
         qp.setPen(QtGui.QColor(70, 90, 130, self._a(255)))
         qp.drawLine(left_pad, sep_y,
@@ -565,67 +667,38 @@ class GameOverlay(_ScaledOverlay):
     def paintEvent(self, _ev):
         qp = QtGui.QPainter(self)
         qp.setRenderHint(QtGui.QPainter.Antialiasing, True)
-        # ===== 배경·테두리: 투명도 적용 =====
         qp.setPen(QtCore.Qt.NoPen)
         qp.setBrush(QtGui.QColor(18, 20, 26, self._a(200)))
         radius = self._px(8)
         qp.drawRoundedRect(self.rect(), radius, radius)
         qp.setPen(QtGui.QColor(90, 110, 160, self._a(255)))
         qp.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), radius, radius)
-        # ===== 이하 글씨: 투명도 영향 없이 원본 alpha 로 렌더 =====
         left_pad = self._px(12)
-        nick_col = self._px(90)
-        # 섹션 1: 힐러 상태.
         qp.setFont(self._font(10))
         qp.setPen(QtGui.QColor(180, 210, 255))
-        qp.drawText(left_pad, self._px(20), "힐러 상태")
-        lines = self._visible_lines()
+        qp.drawText(left_pad, self._px(20), "사냥 분석")
         y = self._px(38)
-        row_h = self._px(22)
-        if not lines:
+        inner_row_h = self._px(18)
+        a_lines = self._analytics_lines()
+        if not a_lines:
             qp.setFont(self._font(9, bold=False))
             qp.setPen(QtGui.QColor(140, 140, 150))
-            qp.drawText(left_pad, y, "모든 스킬 준비됨")
-            y += row_h
+            qp.drawText(left_pad, y, "사냥 데이터 대기")
+            y += inner_row_h
         else:
-            qp.setFont(self._font(11))
-            last_idx = -999
-            for idx, nick, text, cd in lines:
-                if idx != last_idx:
-                    qp.setPen(QtGui.QColor(120, 200, 255))
-                    qp.drawText(left_pad, y, f"{nick}")
-                    last_idx = idx
-                if cd < 0:
-                    color = QtGui.QColor(160, 230, 160)
-                elif cd <= 5:
-                    color = QtGui.QColor(240, 80, 80)
-                elif cd <= 15:
-                    color = QtGui.QColor(240, 170, 60)
-                else:
-                    color = QtGui.QColor(210, 210, 220)
-                qp.setPen(color)
-                qp.drawText(nick_col, y, text)
-                y += row_h
-        # 섹션 2: 사냥 분석.
-        a_lines = self._analytics_lines()
-        if a_lines:
-            y = self._draw_section_header(qp, y, left_pad, "사냥 분석")
             qp.setFont(self._font(9, bold=False))
             qp.setPen(QtGui.QColor(220, 220, 230))
-            a_row_h = self._px(18)
             for s in a_lines:
                 qp.drawText(left_pad, y, s)
-                y += a_row_h
-        # 섹션 3: 맵 히스토리.
+                y += inner_row_h
         m_lines = self._map_history_lines()
         if m_lines:
             y = self._draw_section_header(qp, y, left_pad, "맵 히스토리")
             qp.setFont(self._font(9, bold=False))
             qp.setPen(QtGui.QColor(220, 220, 230))
-            m_row_h = self._px(18)
             for s in m_lines:
                 qp.drawText(left_pad, y, s)
-                y += m_row_h
+                y += inner_row_h
         self._draw_edit_hint(qp)
 
 
